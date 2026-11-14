@@ -90,10 +90,12 @@ object BackupManager {
             photosCount = peopleWithPhotos.size
         )
 
-        // Map state with portable relative photo paths (images/<personId>.jpg)
+        // Map state with portable relative photo paths (images/<personId>.<ext>)
         val portablePeople = state.people.map { person ->
-            val hasPhoto = peopleWithPhotos.any { it.id == person.id }
-            val relativePhoto = if (hasPhoto) "images/${person.id}.jpg" else ""
+            val photoFile = person.photoPath?.takeIf { it.isNotBlank() }?.let { File(it) }
+            val hasPhoto = photoFile != null && photoFile.exists()
+            val ext = if (hasPhoto) (photoFile.extension.takeIf { it.isNotBlank() } ?: "jpg") else "jpg"
+            val relativePhoto = if (hasPhoto) "images/${person.id}.$ext" else ""
             person.copy(photoPath = relativePhoto)
         }
 
@@ -157,7 +159,8 @@ object BackupManager {
             for (person in peopleWithPhotos) {
                 val photoFile = File(person.photoPath!!)
                 if (photoFile.exists()) {
-                    zipOut.putNextEntry(ZipEntry("images/${person.id}.jpg"))
+                    val ext = photoFile.extension.takeIf { it.isNotBlank() } ?: "jpg"
+                    zipOut.putNextEntry(ZipEntry("images/${person.id}.$ext"))
                     photoFile.inputStream().use { input ->
                         input.copyTo(zipOut)
                     }
@@ -212,150 +215,324 @@ object BackupManager {
         var manifestText: String? = null
         var ledgerText: String? = null
         val extractedPhotos = mutableMapOf<String, File>()
+        val seenZipEntries = mutableSetOf<String>()
+        val seenPhotoPersonIds = mutableSetOf<String>()
 
         var totalDecompressedBytes = 0L
         var entriesCount = 0
+        var previewCreated = false
 
-        val zipIn = ZipInputStream(inputStream)
         try {
-            var entry: ZipEntry? = zipIn.nextEntry
-            while (entry != null) {
-                entriesCount++
-                if (entriesCount > MAX_ZIP_ENTRIES_COUNT) {
-                    throw InvalidBackupException("Backup archive exceeds maximum entry limit ($MAX_ZIP_ENTRIES_COUNT)")
-                }
-
-                val entryName = entry.name.replace('\\', '/')
-
-                // Strict path traversal / zip slip check
-                if (entryName.startsWith("/") || entryName.contains(":") || entryName.split("/").contains("..") || entryName.contains("\u0000")) {
-                    throw SecurityException("Illegal ZIP entry path: ${entry.name}")
-                }
-
-                // Strict whitelist of permitted file structures in container
-                if (entryName != "manifest.json" && entryName != "ledger.json" && !entryName.matches(IMAGE_ENTRY_REGEX)) {
-                    throw SecurityException("Unauthorized or malformed entry in backup archive: $entryName")
-                }
-
-                if (entryName == "manifest.json") {
-                    val bytes = readBoundedEntry(zipIn, 1024L * 1024L) // 1 MB limit for manifest
-                    totalDecompressedBytes += bytes.size
-                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
-                    manifestText = String(bytes, Charsets.UTF_8)
-                } else if (entryName == "ledger.json") {
-                    val bytes = readBoundedEntry(zipIn, MAX_JSON_FILE_BYTES) // 10 MB limit for ledger JSON
-                    totalDecompressedBytes += bytes.size
-                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
-                    ledgerText = String(bytes, Charsets.UTF_8)
-                } else if (entryName.startsWith("images/") && !entry.isDirectory) {
-                    val filename = entryName.substringAfterLast('/')
-                    val destFile = File(stagingDir, filename)
-                    if (!destFile.canonicalPath.startsWith(canonicalStagingPath + File.separator)) {
-                        throw SecurityException("Zip traversal detected: $entryName")
+            val zipIn = ZipInputStream(inputStream)
+            try {
+                var entry: ZipEntry? = zipIn.nextEntry
+                while (entry != null) {
+                    entriesCount++
+                    if (entriesCount > MAX_ZIP_ENTRIES_COUNT) {
+                        throw InvalidBackupException("Backup archive exceeds maximum entry limit ($MAX_ZIP_ENTRIES_COUNT)")
                     }
 
-                    val bytes = readBoundedEntry(zipIn, MAX_IMAGE_FILE_BYTES)
-                    totalDecompressedBytes += bytes.size
-                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+                    val entryName = entry.name.replace('\\', '/')
 
-                    // Validate image magic bytes (JPEG or PNG)
-                    validateImageBytes(bytes, entryName)
+                    // Strict duplicate entry rejection
+                    if (!seenZipEntries.add(entryName)) {
+                        throw SecurityException("Duplicate entry in backup archive: $entryName")
+                    }
 
-                    destFile.outputStream().use { it.write(bytes) }
+                    // Strict path traversal / zip slip check
+                    if (entryName.startsWith("/") || entryName.contains(":") || entryName.split("/").contains("..") || entryName.contains("\u0000")) {
+                        throw SecurityException("Illegal ZIP entry path: ${entry.name}")
+                    }
 
-                    val personId = filename.substringBeforeLast('.')
-                    extractedPhotos[personId] = destFile
+                    // Strict whitelist of permitted file structures in container
+                    if (entryName != "manifest.json" && entryName != "ledger.json" && !entryName.matches(IMAGE_ENTRY_REGEX)) {
+                        throw SecurityException("Unauthorized or malformed entry in backup archive: $entryName")
+                    }
+
+                    if (entryName == "manifest.json") {
+                        val bytes = readBoundedEntry(zipIn, 1024L * 1024L) // 1 MB limit for manifest
+                        totalDecompressedBytes += bytes.size
+                        if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+                        manifestText = String(bytes, Charsets.UTF_8)
+                    } else if (entryName == "ledger.json") {
+                        val bytes = readBoundedEntry(zipIn, MAX_JSON_FILE_BYTES) // 10 MB limit for ledger JSON
+                        totalDecompressedBytes += bytes.size
+                        if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+                        ledgerText = String(bytes, Charsets.UTF_8)
+                    } else if (entryName.startsWith("images/") && !entry.isDirectory) {
+                        val filename = entryName.substringAfterLast('/')
+                        val personId = filename.substringBeforeLast('.')
+
+                        // Reject conflicting image entries for the same person ID
+                        if (!seenPhotoPersonIds.add(personId)) {
+                            throw InvalidBackupException("Conflicting profile images for person: '$personId'")
+                        }
+
+                        val destFile = File(stagingDir, filename)
+                        if (!destFile.canonicalPath.startsWith(canonicalStagingPath + File.separator)) {
+                            throw SecurityException("Zip traversal detected: $entryName")
+                        }
+
+                        val bytes = readBoundedEntry(zipIn, MAX_IMAGE_FILE_BYTES)
+                        totalDecompressedBytes += bytes.size
+                        if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+
+                        // Validate image decoding, dimensions, and file size
+                        validateImageBytes(bytes, entryName)
+
+                        destFile.outputStream().use { it.write(bytes) }
+                        extractedPhotos[personId] = destFile
+                    }
+
+                    zipIn.closeEntry()
+                    entry = zipIn.nextEntry
                 }
-
-                zipIn.closeEntry()
-                entry = zipIn.nextEntry
+            } finally {
+                try { zipIn.close() } catch (_: Exception) {}
             }
+
+            if (manifestText.isNullOrBlank()) {
+                throw InvalidBackupException("Backup archive is missing required manifest.json")
+            }
+
+            if (ledgerText.isNullOrBlank()) {
+                throw InvalidBackupException("Backup archive is missing required ledger.json")
+            }
+
+            // Validate mandatory manifest fields and types
+            val manifestObj = try {
+                JSONObject(manifestText)
+            } catch (e: Exception) {
+                throw InvalidBackupException("Malformed manifest.json in backup archive", e)
+            }
+
+            if (!manifestObj.has("app") || manifestObj.isNull("app")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'app'")
+            }
+            val app = manifestObj.getString("app")
+            if (app != "Dueo") {
+                throw InvalidBackupException("Unknown application identifier: '$app'. Only 'Dueo' backups are supported.")
+            }
+
+            if (!manifestObj.has("backupSchemaVersion") || manifestObj.isNull("backupSchemaVersion")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'backupSchemaVersion'")
+            }
+            val schemaVersion = manifestObj.getInt("backupSchemaVersion")
+            if (schemaVersion !in 1..2) {
+                throw InvalidBackupException("Unsupported backup schema version: $schemaVersion")
+            }
+
+            if (!manifestObj.has("exportedAt") || manifestObj.isNull("exportedAt")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'exportedAt'")
+            }
+            val exportedAt = manifestObj.getLong("exportedAt")
+            if (exportedAt <= 0L) {
+                throw InvalidBackupException("Invalid exportedAt timestamp in manifest: $exportedAt")
+            }
+
+            if (!manifestObj.has("peopleCount") || manifestObj.isNull("peopleCount")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'peopleCount'")
+            }
+            val manifestPeople = manifestObj.getInt("peopleCount")
+            if (manifestPeople < 0) {
+                throw InvalidBackupException("Invalid peopleCount in manifest: $manifestPeople")
+            }
+
+            if (!manifestObj.has("entriesCount") || manifestObj.isNull("entriesCount")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'entriesCount'")
+            }
+            val manifestEntries = manifestObj.getInt("entriesCount")
+            if (manifestEntries < 0) {
+                throw InvalidBackupException("Invalid entriesCount in manifest: $manifestEntries")
+            }
+
+            if (!manifestObj.has("photosCount") || manifestObj.isNull("photosCount")) {
+                throw InvalidBackupException("Missing mandatory manifest field: 'photosCount'")
+            }
+            val manifestPhotos = manifestObj.getInt("photosCount")
+            if (manifestPhotos < 0) {
+                throw InvalidBackupException("Invalid photosCount in manifest: $manifestPhotos")
+            }
+
+            // Parse and validate ledger
+            val state = parseAndValidateLedgerJson(ledgerText, stagingDir)
+
+            // Validate that manifest counts strictly match parsed ledger contents
+            if (manifestPeople != state.people.size) {
+                throw InvalidBackupException("Manifest people count ($manifestPeople) does not match ledger contents (${state.people.size})")
+            }
+            if (manifestEntries != state.entries.size) {
+                throw InvalidBackupException("Manifest entries count ($manifestEntries) does not match ledger contents (${state.entries.size})")
+            }
+            if (manifestPhotos != extractedPhotos.size) {
+                throw InvalidBackupException("Manifest photos count ($manifestPhotos) does not match extracted photos count (${extractedPhotos.size})")
+            }
+
+            // Validate that every person with a referenced photo has their image in the archive
+            for (person in state.people) {
+                if (!person.photoPath.isNullOrBlank()) {
+                    val photoFile = extractedPhotos[person.id]
+                    if (photoFile == null || !photoFile.exists()) {
+                        throw InvalidBackupException("Referenced profile photo for person '${person.name}' (${person.id}) is missing from backup")
+                    }
+                }
+            }
+
+            // Validate that all extracted photos belong to known people who actually reference a photo
+            val personIdsWithPhoto = state.people.filter { !it.photoPath.isNullOrBlank() }.map { it.id }.toSet()
+            for (personId in extractedPhotos.keys) {
+                if (!personIdsWithPhoto.contains(personId)) {
+                    throw SecurityException("Backup contains unreferenced profile image for person ID: '$personId'")
+                }
+            }
+
+            val balance = state.entries.balance()
+
+            val preview = BackupPreview(
+                app = app,
+                schemaVersion = schemaVersion,
+                exportedAt = exportedAt,
+                peopleCount = state.people.size,
+                entriesCount = state.entries.size,
+                photosCount = extractedPhotos.size,
+                earliestDate = state.entries.minOfOrNull { it.date },
+                latestDate = state.entries.maxOfOrNull { it.date },
+                totalReceive = balance.receive,
+                totalPay = balance.pay,
+                isZipArchive = true,
+                validatedState = state,
+                extractedPhotos = extractedPhotos,
+                stagingDir = stagingDir
+            )
+            previewCreated = true
+            return preview
         } finally {
-            try { zipIn.close() } catch (_: Exception) {}
-        }
-
-        if (manifestText.isNullOrBlank()) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Backup archive is missing required manifest.json")
-        }
-
-        if (ledgerText.isNullOrBlank()) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Backup archive is missing required ledger.json")
-        }
-
-        // Validate manifest
-        val manifestObj = try {
-            JSONObject(manifestText)
-        } catch (e: Exception) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Malformed manifest.json in backup archive", e)
-        }
-
-        val app = manifestObj.optString("app")
-        if (app != "Dueo") {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Unknown application identifier: '$app'. Only 'Dueo' backups are supported.")
-        }
-
-        val schemaVersion = manifestObj.optInt("backupSchemaVersion", -1)
-        if (schemaVersion !in 1..2) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Unsupported backup schema version: $schemaVersion")
-        }
-
-        // Parse and validate ledger
-        val state = parseAndValidateLedgerJson(ledgerText, stagingDir)
-
-        // Validate that manifest counts strictly match parsed ledger contents
-        val manifestPeople = manifestObj.optInt("peopleCount", -1)
-        val manifestEntries = manifestObj.optInt("entriesCount", -1)
-        if (manifestPeople >= 0 && manifestPeople != state.people.size) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Manifest people count ($manifestPeople) does not match ledger contents (${state.people.size})")
-        }
-        if (manifestEntries >= 0 && manifestEntries != state.entries.size) {
-            stagingDir.deleteRecursively()
-            throw InvalidBackupException("Manifest entries count ($manifestEntries) does not match ledger contents (${state.entries.size})")
-        }
-
-        // Validate person ID format and that all images belong to existing people
-        val personIds = state.people.map { it.id }.toSet()
-        for (personId in extractedPhotos.keys) {
-            if (!personIds.contains(personId)) {
+            if (!previewCreated) {
                 stagingDir.deleteRecursively()
-                throw SecurityException("Backup contains unreferenced profile image for unknown person ID: '$personId'")
             }
         }
-
-        val balance = state.entries.balance()
-
-        return BackupPreview(
-            app = app,
-            schemaVersion = schemaVersion,
-            exportedAt = manifestObj.optLong("exportedAt", System.currentTimeMillis()),
-            peopleCount = state.people.size,
-            entriesCount = state.entries.size,
-            photosCount = extractedPhotos.size,
-            earliestDate = state.entries.minOfOrNull { it.date },
-            latestDate = state.entries.maxOfOrNull { it.date },
-            totalReceive = balance.receive,
-            totalPay = balance.pay,
-            isZipArchive = true,
-            validatedState = state,
-            extractedPhotos = extractedPhotos,
-            stagingDir = stagingDir
-        )
     }
 
     private fun validateImageBytes(bytes: ByteArray, entryName: String) {
-        if (bytes.size < 4) {
-            throw SecurityException("Malformed image in backup '$entryName': file too small")
+        if (bytes.size < 24) {
+            throw SecurityException("Malformed image in backup '$entryName': file too small (${bytes.size} bytes)")
         }
-        val isJpeg = bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()
-        val isPng = bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
-        if (!isJpeg && !isPng) {
+        if (bytes.size > MAX_IMAGE_FILE_BYTES) {
+            throw SecurityException("Image file '$entryName' exceeds maximum allowed size of 5 MB")
+        }
+
+        val isPng = bytes.size >= 24 &&
+                bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() &&
+                bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte() &&
+                bytes[4] == 0x0D.toByte() && bytes[5] == 0x0A.toByte() &&
+                bytes[6] == 0x1A.toByte() && bytes[7] == 0x0A.toByte()
+
+        val isJpeg = bytes.size >= 4 &&
+                bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()
+
+        if (!isPng && !isJpeg) {
             throw SecurityException("Unsafe or invalid image content in backup '$entryName': must be a valid JPEG or PNG file")
+        }
+
+        var width = 0
+        var height = 0
+
+        if (isPng) {
+            // PNG IHDR chunk is located immediately after the 8-byte PNG header
+            // Bytes 8-11: chunk length (must be 13), Bytes 12-15: "IHDR"
+            if (bytes[12] != 0x49.toByte() || bytes[13] != 0x48.toByte() || bytes[14] != 0x44.toByte() || bytes[15] != 0x52.toByte()) {
+                throw SecurityException("Malformed PNG in backup '$entryName': missing IHDR chunk")
+            }
+            width = ((bytes[16].toInt() and 0xFF) shl 24) or ((bytes[17].toInt() and 0xFF) shl 16) or ((bytes[18].toInt() and 0xFF) shl 8) or (bytes[19].toInt() and 0xFF)
+            height = ((bytes[20].toInt() and 0xFF) shl 24) or ((bytes[21].toInt() and 0xFF) shl 16) or ((bytes[22].toInt() and 0xFF) shl 8) or (bytes[23].toInt() and 0xFF)
+            val bitDepth = bytes[24].toInt() and 0xFF
+            val colorType = bytes[25].toInt() and 0xFF
+            if (bitDepth !in listOf(1, 2, 4, 8, 16) || colorType !in listOf(0, 2, 3, 4, 6)) {
+                throw SecurityException("Malformed PNG in backup '$entryName': invalid bit depth ($bitDepth) or color type ($colorType)")
+            }
+        } else {
+            // JPEG segment scanning for SOF0 (0xC0), SOF1 (0xC1), SOF2 (0xC2), SOF3 (0xC3)
+            var offset = 2
+            var foundSof = false
+            while (offset < bytes.size - 8) {
+                if ((bytes[offset].toInt() and 0xFF) != 0xFF) {
+                    offset++
+                    continue
+                }
+                val marker = bytes[offset + 1].toInt() and 0xFF
+                if (marker == 0xD9 || marker == 0xDA) {
+                    // End of image or Start of scan reached
+                    break
+                }
+                if (marker in 0xC0..0xC3) {
+                    height = ((bytes[offset + 5].toInt() and 0xFF) shl 8) or (bytes[offset + 6].toInt() and 0xFF)
+                    width = ((bytes[offset + 7].toInt() and 0xFF) shl 8) or (bytes[offset + 8].toInt() and 0xFF)
+                    foundSof = true
+                    break
+                }
+                val segLen = ((bytes[offset + 2].toInt() and 0xFF) shl 8) or (bytes[offset + 3].toInt() and 0xFF)
+                if (segLen < 2) break
+                offset += 2 + segLen
+            }
+            if (!foundSof || width <= 0 || height <= 0) {
+                throw SecurityException("Malformed JPEG in backup '$entryName': missing or invalid SOF frame dimensions")
+            }
+        }
+
+        if (width <= 0 || height <= 0) {
+            throw SecurityException("Image '$entryName' has invalid dimensions: ${width}x${height}")
+        }
+        if (width > 8192 || height > 8192) {
+            throw SecurityException("Image '$entryName' dimensions exceed maximum allowed size (8192x8192): ${width}x${height}")
+        }
+
+        // Platform decoding validation: attempt decoding with Android BitmapFactory or Java ImageIO
+        var decodeSuccess = false
+        var decodeAttempted = false
+
+        // Try Android BitmapFactory
+        try {
+            val bfClass = Class.forName("android.graphics.BitmapFactory")
+            val optsClass = Class.forName("android.graphics.BitmapFactory\$Options")
+            val opts = optsClass.getConstructor().newInstance()
+            optsClass.getField("inJustDecodeBounds").setBoolean(opts, true)
+            val decodeMethod = bfClass.getMethod(
+                "decodeByteArray",
+                ByteArray::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                optsClass
+            )
+            decodeMethod.invoke(null, bytes, 0, bytes.size, opts)
+            val outWidth = optsClass.getField("outWidth").getInt(opts)
+            val outHeight = optsClass.getField("outHeight").getInt(opts)
+            if (outWidth > 0 && outHeight > 0) {
+                decodeSuccess = true
+            }
+            decodeAttempted = true
+        } catch (_: Throwable) {}
+
+        // Try Java ImageIO (desktop JVM)
+        if (!decodeSuccess) {
+            try {
+                val imageIoClass = Class.forName("javax.imageio.ImageIO")
+                val readMethod = imageIoClass.getMethod("read", InputStream::class.java)
+                val bufferedImage = readMethod.invoke(null, ByteArrayInputStream(bytes))
+                if (bufferedImage != null) {
+                    val getWidthMethod = bufferedImage.javaClass.getMethod("getWidth")
+                    val getHeightMethod = bufferedImage.javaClass.getMethod("getHeight")
+                    val w = getWidthMethod.invoke(bufferedImage) as Int
+                    val h = getHeightMethod.invoke(bufferedImage) as Int
+                    if (w > 0 && h > 0) {
+                        decodeSuccess = true
+                    }
+                }
+                decodeAttempted = true
+            } catch (_: Throwable) {}
+        }
+
+        if (decodeAttempted && !decodeSuccess) {
+            throw SecurityException("Failed to decode image '$entryName': corrupted or unsupported image data")
         }
     }
 

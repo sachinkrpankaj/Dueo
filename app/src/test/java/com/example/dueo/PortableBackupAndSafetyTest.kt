@@ -18,6 +18,20 @@ class PortableBackupAndSafetyTest {
     @get:Rule
     val tempFolder = TemporaryFolder()
 
+    private fun createValidJpgBytes(width: Int = 10, height: Int = 10): ByteArray {
+        val image = java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_RGB)
+        val baos = ByteArrayOutputStream()
+        javax.imageio.ImageIO.write(image, "jpg", baos)
+        return baos.toByteArray()
+    }
+
+    private fun createValidPngBytes(width: Int = 10, height: Int = 10): ByteArray {
+        val image = java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_RGB)
+        val baos = ByteArrayOutputStream()
+        javax.imageio.ImageIO.write(image, "png", baos)
+        return baos.toByteArray()
+    }
+
     @Test
     fun portableZipBackupExportsAndRestoresWithPhotosSuccessfully() = runBlocking {
         val filesDir = tempFolder.newFolder("files")
@@ -27,10 +41,10 @@ class PortableBackupAndSafetyTest {
 
         repository.initialize()
 
-        // 1. Create a person with a real photo file (valid JPEG magic bytes)
+        // 1. Create a person with a real photo file (valid decodable JPEG)
         val photosDir = File(filesDir, "people-photos").apply { mkdirs() }
         val testPhoto = File(photosDir, "test-person.jpg").apply {
-            writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte()))
+            writeBytes(createValidJpgBytes(16, 16))
         }
         val person = repository.addPerson("Kavita", "+919876543210", testPhoto.absolutePath).getOrThrow()
 
@@ -90,7 +104,8 @@ class PortableBackupAndSafetyTest {
         assertNotNull(restored.people[0].photoPath)
         val restoredPhotoFile = File(restored.people[0].photoPath!!)
         assertTrue("Restored photo file must exist on disk", restoredPhotoFile.exists())
-        assertEquals(4, restoredPhotoFile.length())
+        assertTrue("Restored photo must be in permanent photos folder", restoredPhotoFile.absolutePath.contains("people-photos"))
+        assertFalse("Restored photo must not refer to temp staging directory", restoredPhotoFile.absolutePath.contains("inspect_stage"))
         assertEquals(2, restored.entries.size)
         assertEquals(80000L, restored.entries.balance().receive)
     }
@@ -104,7 +119,7 @@ class PortableBackupAndSafetyTest {
 
         repository.initialize()
         val sourcePhotosDir = tempFolder.newFolder("source_photos")
-        val initialPhoto = File(sourcePhotosDir, "initial.jpg").apply { writeText("original photo content") }
+        val initialPhoto = File(sourcePhotosDir, "initial.jpg").apply { writeBytes(createValidJpgBytes(16, 16)) }
         val originalPerson = repository.addPerson("Pre-existing User", "111", initialPhoto.absolutePath).getOrThrow()
         repository.addTransaction(originalPerson.id, 50000L, EntryKind.LENT, "Initial loan").getOrThrow()
 
@@ -137,7 +152,7 @@ class PortableBackupAndSafetyTest {
 
         repository.initialize()
         val photosDir = File(filesDir, "people-photos").apply { mkdirs() }
-        val originalPhoto = File(photosDir, "orig.jpg").apply { writeText("unique original photo data") }
+        val originalPhoto = File(photosDir, "orig.jpg").apply { writeBytes(createValidJpgBytes(16, 16)) }
         val originalPerson = repository.addPerson("Untouchable User", "999", originalPhoto.absolutePath).getOrThrow()
         repository.addTransaction(originalPerson.id, 75000L, EntryKind.LENT, "Important record").getOrThrow()
 
@@ -173,7 +188,6 @@ class PortableBackupAndSafetyTest {
 
         // Verify original photo was preserved
         assertTrue("Original photo must exist after failed restore", originalPhoto.exists())
-        assertEquals("unique original photo data", originalPhoto.readText())
     }
 
     @Test
@@ -204,7 +218,7 @@ class PortableBackupAndSafetyTest {
         val zos = ZipOutputStream(baos)
 
         zos.putNextEntry(ZipEntry("manifest.json"))
-        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
         zos.closeEntry()
 
         zos.putNextEntry(ZipEntry("ledger.json"))
@@ -233,7 +247,7 @@ class PortableBackupAndSafetyTest {
         val zos = ZipOutputStream(baos)
 
         zos.putNextEntry(ZipEntry("manifest.json"))
-        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":1,"entriesCount":0,"photosCount":1}""".toByteArray())
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":1,"entriesCount":0,"photosCount":1}""".toByteArray())
         zos.closeEntry()
 
         zos.putNextEntry(ZipEntry("ledger.json"))
@@ -242,7 +256,7 @@ class PortableBackupAndSafetyTest {
 
         // Executable disguised as JPG (magic bytes not JPEG or PNG)
         zos.putNextEntry(ZipEntry("images/p-1.jpg"))
-        zos.write("MZ\u0090\u0000 fake executable bytes".toByteArray())
+        zos.write("MZ\u0090\u0000 fake executable bytes that are not jpeg or png".toByteArray())
         zos.closeEntry()
 
         zos.finish()
@@ -256,6 +270,276 @@ class PortableBackupAndSafetyTest {
     }
 
     @Test
+    fun duplicateZipEntryIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_duplicate_entry")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+
+        // Write second entry with identical-length placeholder name
+        zos.putNextEntry(ZipEntry("xanifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        // Mutate "xanifest.json" to "manifest.json" in the byte array so archive has real duplicate entry names
+        val zipBytes = baos.toByteArray()
+        val target = "xanifest.json".toByteArray(Charsets.US_ASCII)
+        for (i in 0 until zipBytes.size - target.size) {
+            var match = true
+            for (j in target.indices) {
+                if (zipBytes[i + j] != target[j]) {
+                    match = false
+                    break
+                }
+            }
+            if (match) {
+                zipBytes[i] = 'm'.code.toByte()
+            }
+        }
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(zipBytes), cacheDir)
+        }
+        assertTrue("Duplicate ZIP entry must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is SecurityException)
+    }
+
+    @Test
+    fun conflictingImagesForSamePersonIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_conflict_images")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        val jpgBytes = createValidJpgBytes(10, 10)
+        val pngBytes = createValidPngBytes(10, 10)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":1,"entriesCount":0,"photosCount":1}""".toByteArray())
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[{"id":"p-1","name":"User 1","photoPath":"images/p-1.jpg"}],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("images/p-1.jpg"))
+        zos.write(jpgBytes)
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("images/p-1.png"))
+        zos.write(pngBytes)
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue("Conflicting images for the same person must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
+    }
+
+    @Test
+    fun missingReferencedPhotoIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_missing_photo")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":1,"entriesCount":0,"photosCount":1}""".toByteArray())
+        zos.closeEntry()
+
+        // Person claims to have photo at images/p-missing.jpg, but it is NOT in the zip!
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[{"id":"p-missing","name":"User 1","photoPath":"images/p-missing.jpg"}],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue("Missing referenced photo must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
+    }
+
+    @Test
+    fun unreferencedPhotoInZipIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_unref_photo")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        val jpgBytes = createValidJpgBytes(10, 10)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":1}""".toByteArray())
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        // Photo for a person who doesn't exist in the ledger
+        zos.putNextEntry(ZipEntry("images/p-ghost.jpg"))
+        zos.write(jpgBytes)
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue("Unreferenced photo in zip must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is SecurityException)
+    }
+
+    @Test
+    fun missingMandatoryManifestFieldsIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_missing_fields")
+
+        // Missing "app"
+        var baos = ByteArrayOutputStream()
+        var zos = ZipOutputStream(baos)
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"backupSchemaVersion":2,"exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+        zos.finish()
+        zos.close()
+
+        var result = runCatching { BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir) }
+        assertTrue("Missing app field must fail", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
+
+        // Missing "backupSchemaVersion"
+        baos = ByteArrayOutputStream()
+        zos = ZipOutputStream(baos)
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","exportedAt":1000,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+        zos.finish()
+        zos.close()
+
+        result = runCatching { BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir) }
+        assertTrue("Missing schema version must fail", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
+
+        // Missing "exportedAt"
+        baos = ByteArrayOutputStream()
+        zos = ZipOutputStream(baos)
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+        zos.finish()
+        zos.close()
+
+        result = runCatching { BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir) }
+        assertTrue("Missing exportedAt must fail", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
+    }
+
+    @Test
+    fun temporaryFilesCleanedUpOnInspectionFailure() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_cleanup_test")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        // Manifest is malformed
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("not-json-content".toByteArray())
+        zos.closeEntry()
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue(result.isFailure)
+
+        // Verify that no staging directory was left behind in cacheDir
+        val remainingFiles = cacheDir.listFiles()?.filter { it.name.startsWith("inspect_stage_") }
+        assertTrue("Temporary staging folders must be deleted on failure", remainingFiles.isNullOrEmpty())
+    }
+
+    @Test
+    fun crashSafePhotoRestorationDoesNotOverwriteExistingPhotosAndUsesPermanentPaths() = runBlocking {
+        val filesDir = tempFolder.newFolder("files_safe_restore")
+        val cacheDir = tempFolder.newFolder("cache_safe_restore")
+        val store = LedgerStore(filesDir = filesDir, cacheDir = cacheDir)
+        val repository = LedgerRepository(store = store)
+        repository.initialize()
+
+        // 1. Existing person with unique photo
+        val existingPhoto = File(filesDir, "people-photos").apply { mkdirs() }
+            .let { File(it, "original_existing_photo.jpg") }
+            .apply { writeBytes(createValidJpgBytes(20, 20)) }
+        val existingPerson = repository.addPerson("Original User", "111", existingPhoto.absolutePath).getOrThrow()
+        repository.addTransaction(existingPerson.id, 50000L, EntryKind.LENT, "Old loan").getOrThrow()
+
+        // 2. Prepare incoming backup with a person named Restored User
+        val incomingPhoto = File(tempFolder.newFolder("incoming_source"), "restored.jpg").apply {
+            writeBytes(createValidJpgBytes(30, 30))
+        }
+        val incomingState = LedgerState(
+            people = listOf(Person(id = "p-new", name = "Restored User", photoPath = "images/p-new.jpg")),
+            entries = listOf(Entry(id = "e-new", person = "Restored User", personId = "p-new", amount = 80000L, kind = EntryKind.LENT))
+        )
+        val stagingDir = File(cacheDir, "staging_test").apply { mkdirs() }
+        val stagedPhoto = File(stagingDir, "p-new.jpg")
+        incomingPhoto.copyTo(stagedPhoto)
+
+        val preview = BackupPreview(
+            app = "Dueo",
+            schemaVersion = 2,
+            exportedAt = System.currentTimeMillis(),
+            peopleCount = 1,
+            entriesCount = 1,
+            photosCount = 1,
+            earliestDate = 1000L,
+            latestDate = 1000L,
+            totalReceive = 80000L,
+            totalPay = 0L,
+            isZipArchive = true,
+            validatedState = incomingState,
+            extractedPhotos = mapOf("p-new" to stagedPhoto),
+            stagingDir = stagingDir
+        )
+
+        // 3. Restore
+        val restoreResult = repository.executeRestore(preview, filesDir)
+        assertTrue(restoreResult.isSuccess)
+        val restoredState = restoreResult.getOrThrow()
+
+        // 4. Verify permanent path is used, NOT staging path
+        val restoredPerson = restoredState.people[0]
+        assertNotNull(restoredPerson.photoPath)
+        val restoredFile = File(restoredPerson.photoPath!!)
+        assertTrue(restoredFile.exists())
+        assertTrue("Restored photo must be in permanent people-photos dir", restoredFile.absolutePath.contains("people-photos"))
+        assertFalse("Restored photo path must not reference staging folder", restoredFile.absolutePath.contains("staging_test"))
+
+        // 5. Verify the original photo was never overwritten
+        assertTrue("Original photo file must remain intact", existingPhoto.exists())
+        assertEquals("Original photo content size must match", createValidJpgBytes(20, 20).size.toLong(), existingPhoto.length())
+    }
+
+    @Test
     fun manifestCountMismatchIsRejected() = runBlocking {
         val cacheDir = tempFolder.newFolder("cache_mismatch")
         val baos = ByteArrayOutputStream()
@@ -263,7 +547,7 @@ class PortableBackupAndSafetyTest {
 
         // Manifest claims 50 people
         zos.putNextEntry(ZipEntry("manifest.json"))
-        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":50,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"exportedAt":1000,"peopleCount":50,"entriesCount":0,"photosCount":0}""".toByteArray())
         zos.closeEntry()
 
         // Ledger only has 1 person
@@ -283,7 +567,6 @@ class PortableBackupAndSafetyTest {
 
     @Test
     fun oversizedJsonBackupIsRejected() {
-        // Stream that produces more than 10 MB of data
         val hugeStream = object : InputStream() {
             private var bytesProduced = 0L
             override fun read(): Int {

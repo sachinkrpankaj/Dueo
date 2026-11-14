@@ -7,6 +7,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.io.FileOutputStream
 
 class TransactionIdempotencyAndDateEditingTest {
 
@@ -35,7 +36,7 @@ class TransactionIdempotencyAndDateEditingTest {
         assertTrue(firstResult.isSuccess)
         val firstEntry = firstResult.getOrThrow()
 
-        // Second call with same clientOperationId
+        // Second call with same clientOperationId and same details
         val secondResult = repository.addTransaction(
             personId = person.id,
             amount = 100000L,
@@ -100,8 +101,8 @@ class TransactionIdempotencyAndDateEditingTest {
     }
 
     @Test
-    fun rapidDoubleSubmissionWithoutOpIdIsDeduplicatedWithinTimeWindow() = runBlocking {
-        val filesDir = tempFolder.newFolder("files_rapid_double")
+    fun twoLegitimateIdenticalTransactionsWithDifferentOperationIdsBothSucceed() = runBlocking {
+        val filesDir = tempFolder.newFolder("files_two_identical")
         val store = LedgerStore(filesDir = filesDir)
         val repository = LedgerRepository(store = store)
 
@@ -109,12 +110,63 @@ class TransactionIdempotencyAndDateEditingTest {
         val person = repository.addPerson("Anita", "888", null).getOrThrow()
 
         val time = System.currentTimeMillis()
-        val first = repository.addTransaction(person.id, 50000L, EntryKind.LENT, "Dinner", date = time).getOrThrow()
-        // Immediate second tap with identical parameters
-        val second = repository.addTransaction(person.id, 50000L, EntryKind.LENT, "Dinner", date = time + 100L).getOrThrow()
+        // Transaction 1: Coffee loan $50
+        val first = repository.addTransaction(
+            personId = person.id,
+            amount = 5000L,
+            kind = EntryKind.LENT,
+            note = "Coffee",
+            date = time,
+            clientOperationId = "op-first-coffee"
+        ).getOrThrow()
 
-        assertEquals("Rapid duplicate tap must return existing entry", first.id, second.id)
-        assertEquals(1, repository.getCurrentState()!!.entries.size)
+        // Transaction 2: Second coffee loan $50 with identical parameters but different operation ID
+        val second = repository.addTransaction(
+            personId = person.id,
+            amount = 5000L,
+            kind = EntryKind.LENT,
+            note = "Coffee",
+            date = time,
+            clientOperationId = "op-second-coffee"
+        ).getOrThrow()
+
+        assertNotEquals("Different operation IDs must create distinct transactions", first.id, second.id)
+        val state = repository.getCurrentState()!!
+        assertEquals("Both legitimate identical transactions must be saved", 2, state.entries.size)
+        assertEquals(10000L, state.entries.balance().receive)
+    }
+
+    @Test
+    fun reusingOperationIdWithConflictingDetailsIsRejected() = runBlocking {
+        val filesDir = tempFolder.newFolder("files_conflicting_op")
+        val store = LedgerStore(filesDir = filesDir)
+        val repository = LedgerRepository(store = store)
+
+        repository.initialize()
+        val person = repository.addPerson("Rohit", "555", null).getOrThrow()
+
+        val opId = "reused-op-id-test"
+
+        // Initial submission
+        repository.addTransaction(
+            personId = person.id,
+            amount = 50000L,
+            kind = EntryKind.LENT,
+            note = "Initial loan",
+            clientOperationId = opId
+        ).getOrThrow()
+
+        // Reuse operation ID with conflicting amount (100000 instead of 50000)
+        val conflictResult = repository.addTransaction(
+            personId = person.id,
+            amount = 100000L,
+            kind = EntryKind.LENT,
+            note = "Initial loan",
+            clientOperationId = opId
+        )
+
+        assertTrue("Reusing operation ID with conflicting details must be rejected", conflictResult.isFailure)
+        assertTrue(conflictResult.exceptionOrNull() is IllegalStateException)
     }
 
     @Test
@@ -140,6 +192,71 @@ class TransactionIdempotencyAndDateEditingTest {
         val recoveredStream = atomicFile.openRead()
         val recoveredContent = recoveredStream.bufferedReader().use { it.readText() }
         assertEquals("Atomic file must recover the valid data from .bak", initialJson, recoveredContent)
+    }
+
+    @Test
+    fun interruptedWriteWithPartialBaseFileRecoversBackupWithoutDeletingIt() {
+        val filesDir = tempFolder.newFolder("atomic_partial_write")
+        val baseFile = File(filesDir, "ledger-v2.json")
+        val atomicFile = SafeAtomicFile(baseFile)
+
+        // 1. Initial successfully committed state
+        val validJson = """{"version":2,"people":[{"id":"p-1","name":"Alice","phone":"","photoPath":null}],"entries":[]}"""
+        val out = atomicFile.startWrite()
+        out.write(validJson.toByteArray(Charsets.UTF_8))
+        atomicFile.finishWrite(out)
+
+        assertTrue(baseFile.exists())
+        assertFalse(atomicFile.backupFile.exists())
+
+        // 2. Simulate next write that is interrupted/crashed while partially written
+        val partialStream = atomicFile.startWrite()
+        partialStream.write("""{"version":2,"people":[{"id":""".toByteArray(Charsets.UTF_8))
+        partialStream.flush()
+        // Crash! Stream is not finished; baseFile exists with partial content and backupFile exists with validJson
+        assertTrue("baseFile must exist with partial bytes", baseFile.exists() && baseFile.length() > 0)
+        assertTrue("backupFile must exist", atomicFile.backupFile.exists())
+
+        // 3. App restarts and calls openRead()
+        val readStream = atomicFile.openRead()
+        val readContent = readStream.bufferedReader().use { it.readText() }
+
+        assertEquals("Must recover the last successfully committed valid JSON", validJson, readContent)
+    }
+
+    @Test
+    fun startWritePreservesBackupIfPreviousWriteWasInterrupted() {
+        val filesDir = tempFolder.newFolder("atomic_start_write_preserves")
+        val baseFile = File(filesDir, "ledger-v2.json")
+        val atomicFile = SafeAtomicFile(baseFile)
+
+        val validJson = """{"version":2,"people":[],"entries":[]}"""
+        val out1 = atomicFile.startWrite()
+        out1.write(validJson.toByteArray(Charsets.UTF_8))
+        atomicFile.finishWrite(out1)
+
+        // Simulate interrupted write #1
+        val out2 = atomicFile.startWrite()
+        out2.write("corrupted junk".toByteArray())
+        out2.flush()
+        // Crash before finishWrite
+
+        assertTrue(atomicFile.backupFile.exists())
+
+        // Next session starts a new write
+        val out3 = atomicFile.startWrite()
+        // Backup file must STILL exist holding validJson
+        assertTrue("Backup file must not be destroyed when starting another write", atomicFile.backupFile.exists())
+        assertEquals(validJson, atomicFile.backupFile.readText())
+
+        // Finish write #3
+        val newValidJson = """{"version":2,"people":[],"entries":[{"id":"e1","person":"Bob","personId":"p1","amount":500,"kind":"LENT","note":"","date":1000}]}"""
+        out3.write(newValidJson.toByteArray(Charsets.UTF_8))
+        atomicFile.finishWrite(out3)
+
+        // Only after finishWrite is backup deleted
+        assertFalse(atomicFile.backupFile.exists())
+        assertEquals(newValidJson, baseFile.readText())
     }
 
     @Test

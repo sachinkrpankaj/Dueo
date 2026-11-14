@@ -7,6 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
@@ -24,66 +25,78 @@ data class LedgerState(
 )
 
 /**
- * Robust atomic file persistence.
- * Implements write-ahead backup file (.bak) semantics with fsync,
- * working identically in Android runtime and JVM unit testing.
+ * Robust atomic file persistence implementing Android AtomicFile design.
+ * Guarantees crash consistency: an interrupted write never destroys the last committed file.
+ * Automatically recovers from backup (.bak) on crash, partial write, or corruption.
  */
 class SafeAtomicFile(val baseFile: File) {
     val backupFile = File(baseFile.path + ".bak")
 
     fun exists(): Boolean = (baseFile.exists() && baseFile.length() > 0L) || (backupFile.exists() && backupFile.length() > 0L)
 
+    /**
+     * Opens the file for reading. If a backup file exists, an interrupted write occurred,
+     * so baseFile is discarded and backupFile is restored to baseFile.
+     */
     fun openRead(): InputStream {
         if (backupFile.exists() && backupFile.length() > 0L) {
-            if (!baseFile.exists() || baseFile.length() == 0L) {
-                baseFile.delete()
-                if (!backupFile.renameTo(baseFile)) {
-                    runCatching {
-                        backupFile.copyTo(baseFile, overwrite = true)
-                        backupFile.delete()
-                    }
+            // Write was interrupted before completion. Discard partial/uncommitted baseFile and restore backupFile.
+            baseFile.delete()
+            if (!backupFile.renameTo(baseFile)) {
+                if (!tryCopy(backupFile, baseFile)) {
+                    // If copy also fails, read directly from backupFile to avoid deleting/losing valid data!
+                    return backupFile.inputStream()
                 }
-            } else {
                 backupFile.delete()
             }
         }
-        if (baseFile.exists() && baseFile.length() > 0L) {
+        if (baseFile.exists()) {
             return baseFile.inputStream()
-        } else if (backupFile.exists() && backupFile.length() > 0L) {
+        }
+        if (backupFile.exists()) {
             return backupFile.inputStream()
         }
-        return baseFile.inputStream()
+        throw FileNotFoundException("File does not exist: ${baseFile.path}")
     }
 
+    /**
+     * Starts a new write. If baseFile exists, it is renamed to backupFile so the previous
+     * committed state is preserved during the write.
+     */
     fun startWrite(): OutputStream {
         val parent = baseFile.parentFile
         if (parent != null && !parent.exists()) {
             parent.mkdirs()
         }
 
-        if (baseFile.exists() && baseFile.length() > 0L) {
-            if (!backupFile.exists() || backupFile.length() == 0L) {
-                if (!baseFile.renameTo(backupFile)) {
-                    baseFile.copyTo(backupFile, overwrite = true)
-                    baseFile.delete()
+        if (backupFile.exists()) {
+            // A previous write was interrupted. Delete baseFile (the partial file) and preserve backupFile
+            // so that if this write also crashes, backupFile still holds the last good committed state.
+            baseFile.delete()
+        } else if (baseFile.exists()) {
+            if (!baseFile.renameTo(backupFile)) {
+                if (!tryCopy(baseFile, backupFile)) {
+                    throw IOException("Failed to create backup file before writing: ${backupFile.path}")
                 }
-            } else {
                 baseFile.delete()
             }
-        } else if (baseFile.exists()) {
-            baseFile.delete()
         }
 
         return try {
             FileOutputStream(baseFile)
         } catch (e: Exception) {
-            if (backupFile.exists() && backupFile.length() > 0L) {
-                backupFile.copyTo(baseFile, overwrite = true)
+            // If opening stream fails, attempt to restore backup
+            if (backupFile.exists() && !baseFile.exists()) {
+                backupFile.renameTo(baseFile)
             }
             throw e
         }
     }
 
+    /**
+     * Successfully finishes a write. Flushes, syncs to disk (fsync), closes the stream,
+     * and deletes backupFile ONLY AFTER verifying that baseFile was successfully written and non-empty.
+     */
     fun finishWrite(stream: OutputStream) {
         try {
             stream.flush()
@@ -95,11 +108,16 @@ class SafeAtomicFile(val baseFile: File) {
         } finally {
             stream.close()
         }
+
+        // Never delete a valid backup before verifying that the base file exists and is non-empty
         if (baseFile.exists() && baseFile.length() > 0L) {
             backupFile.delete()
         }
     }
 
+    /**
+     * Fails a write. Discards partial baseFile and restores backupFile to baseFile.
+     */
     fun failWrite(stream: OutputStream) {
         try {
             stream.flush()
@@ -107,12 +125,20 @@ class SafeAtomicFile(val baseFile: File) {
         try {
             stream.close()
         } catch (_: Exception) {}
+
         baseFile.delete()
         if (backupFile.exists() && backupFile.length() > 0L) {
             if (!backupFile.renameTo(baseFile)) {
-                runCatching { backupFile.copyTo(baseFile, overwrite = true) }
+                tryCopy(backupFile, baseFile)
             }
         }
+    }
+
+    private fun tryCopy(source: File, dest: File): Boolean {
+        return runCatching {
+            source.copyTo(dest, overwrite = true)
+            dest.exists() && dest.length() == source.length()
+        }.getOrDefault(false)
     }
 }
 
@@ -208,6 +234,17 @@ class LedgerStore(
         try {
             root = JSONObject(rawText)
         } catch (jsonEx: JSONException) {
+            // Check if backup file is available and valid before declaring failure
+            if (atomicFile.backupFile.exists() && atomicFile.backupFile.length() > 0L) {
+                try {
+                    val bakText = atomicFile.backupFile.bufferedReader().use { it.readText() }
+                    val bakRoot = JSONObject(bakText)
+                    if (bakRoot.optInt("version") == 2) {
+                        atomicFile.backupFile.copyTo(atomicFile.baseFile, overwrite = true)
+                        return loadLedger()
+                    }
+                } catch (_: Exception) {}
+            }
             val backup = preserveCorruptedFile(ledgerFile, "malformed_json")
             return LedgerLoadResult.RecoverableFailure(
                 message = "Ledger contains malformed JSON",

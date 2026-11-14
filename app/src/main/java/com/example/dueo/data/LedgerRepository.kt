@@ -11,6 +11,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
@@ -118,7 +119,7 @@ class LedgerRepository(
 
     /**
      * Adds a new transaction atomically after independent financial validation.
-     * Supports an optional clientOperationId for idempotency to protect against double submissions.
+     * Uses persistent clientOperationId to identify repeated submissions idempotently.
      */
     suspend fun addTransaction(
         personId: String,
@@ -136,29 +137,30 @@ class LedgerRepository(
                     else -> store.readState()
                 }
 
-                // Check persistent ledger first for idempotency across app restarts
-                if (!clientOperationId.isNullOrBlank()) {
-                    val existingPersistent = currentLedger.entries.firstOrNull { it.clientOperationId == clientOperationId }
-                    if (existingPersistent != null) {
-                        return@withContext Result.success(existingPersistent)
-                    }
-                    val cached = recentOperations[clientOperationId]
-                    if (cached != null) {
-                        return@withContext Result.success(cached)
-                    }
-                }
-
-                // Check recent submission within 5 seconds with identical parameters to prevent rapid double-saves
                 val trimmedNote = note.trim()
-                val recentDuplicate = currentLedger.entries.lastOrNull {
-                    it.personId == personId &&
-                    it.amount == amount &&
-                    it.kind == kind &&
-                    it.note == trimmedNote &&
-                    Math.abs(it.date - date) < 5_000L
-                }
-                if (recentDuplicate != null) {
-                    return@withContext Result.success(recentDuplicate)
+                val effectiveOpId = clientOperationId?.trim()?.takeIf { it.isNotEmpty() }
+
+                // Check persistent ledger entries and in-memory cache for idempotency
+                if (effectiveOpId != null) {
+                    val existingEntry = currentLedger.entries.firstOrNull { it.clientOperationId == effectiveOpId }
+                        ?: recentOperations[effectiveOpId]
+
+                    if (existingEntry != null) {
+                        // Check if all transaction details match the original submission
+                        val matches = existingEntry.personId == personId &&
+                                existingEntry.amount == amount &&
+                                existingEntry.kind == kind &&
+                                existingEntry.note == trimmedNote &&
+                                existingEntry.dueDate == dueDate
+
+                        return@withContext if (matches) {
+                            Result.success(existingEntry)
+                        } else {
+                            Result.failure(
+                                IllegalStateException("Reused operation ID '$effectiveOpId' with conflicting transaction details.")
+                            )
+                        }
+                    }
                 }
 
                 val person = currentLedger.people.firstOrNull { it.id == personId }
@@ -173,7 +175,7 @@ class LedgerRepository(
                     note = trimmedNote,
                     date = date,
                     dueDate = dueDate,
-                    clientOperationId = clientOperationId
+                    clientOperationId = effectiveOpId ?: UUID.randomUUID().toString()
                 )
 
                 // Enforce domain validation on prospective state
@@ -181,8 +183,8 @@ class LedgerRepository(
 
                 val updatedLedger = currentLedger.copy(entries = currentLedger.entries + newEntry)
                 store.writeState(updatedLedger)
-                if (!clientOperationId.isNullOrBlank()) {
-                    recentOperations[clientOperationId] = newEntry
+                if (newEntry.clientOperationId != null) {
+                    recentOperations[newEntry.clientOperationId] = newEntry
                 }
                 _uiState.value = LedgerUiState.Ready(updatedLedger)
                 Result.success(newEntry)
@@ -275,29 +277,39 @@ class LedgerRepository(
     }
 
     /**
-     * Executes a transactional restore from a validated BackupPreview.
+     * Executes a crash-safe transactional restore from a validated BackupPreview.
      * Takes an automatic pre-restore safety snapshot of the existing valid ledger AND existing profile photos.
-     * Stages new photos in isolation until validation and disk commit succeed.
-     * If any failure occurs, original financial records and profile photos are completely rolled back and preserved.
+     * Imported photos are copied to unique permanent filenames first, without overwriting existing photos.
+     * The final ledger JSON is committed once using only permanent paths.
+     * If any failure occurs, original financial records and profile photos are completely rolled back and preserved,
+     * and any unreferenced new files are cleaned up.
      */
     suspend fun executeRestore(preview: BackupPreview, filesDir: File): Result<LedgerState> = mutex.withLock {
         withContext(ioDispatcher) {
             var snapshotFolder: File? = null
-            var stagingPhotosDir: File? = null
+            val newlyCreatedPermanentFiles = mutableListOf<File>()
+            val permanentPhotosDir = File(filesDir, "people-photos").apply { mkdirs() }
+            var restoreSucceeded = false
+
             try {
-                // 1. Create safety snapshot of current valid ledger AND all existing profile photos
+                // 1. Create recoverable safety snapshot of current valid ledger AND all existing profile photos
                 snapshotFolder = BackupManager.createPreRestoreSnapshot(filesDir)
 
-                // 2. Stage extracted photos in an isolated staging folder so existing photos are never touched prematurely
-                stagingPhotosDir = File(filesDir, "staging_photos_${System.currentTimeMillis()}_${UUID.randomUUID()}").apply { mkdirs() }
+                // 2. Copy imported photos to unique permanent filenames FIRST without overwriting existing files
                 val updatedPeople = preview.validatedState.people.map { person ->
                     val extractedPhoto = preview.extractedPhotos[person.id]
                     if (extractedPhoto != null && extractedPhoto.exists()) {
-                        val stagedFile = File(stagingPhotosDir, "${person.id}.jpg")
-                        extractedPhoto.copyTo(stagedFile, overwrite = true)
-                        person.copy(photoPath = stagedFile.absolutePath)
+                        val extension = extractedPhoto.extension.takeIf { it.isNotBlank() } ?: "jpg"
+                        val uniqueFilename = "photo_${person.id}_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}.$extension"
+                        val permanentPhotoFile = File(permanentPhotosDir, uniqueFilename)
+
+                        extractedPhoto.copyTo(permanentPhotoFile, overwrite = false)
+                        if (!permanentPhotoFile.exists() || permanentPhotoFile.length() == 0L) {
+                            throw IOException("Failed to write permanent photo for person: ${person.id}")
+                        }
+                        newlyCreatedPermanentFiles.add(permanentPhotoFile)
+                        person.copy(photoPath = permanentPhotoFile.absolutePath)
                     } else {
-                        // For legacy JSON or absent photos, retain existing local file if valid, else null
                         val existingLocal = if (!person.photoPath.isNullOrBlank() && File(person.photoPath).exists()) {
                             person.photoPath
                         } else null
@@ -305,47 +317,41 @@ class LedgerRepository(
                     }
                 }
 
-                val interimState = preview.validatedState.copy(people = updatedPeople)
-                validator.validateLedger(interimState)
+                val finalCommittedState = preview.validatedState.copy(people = updatedPeople)
 
-                // 3. Atomically write the restored state
-                store.writeState(interimState)
+                // 3. Validate financial domain invariants
+                validator.validateLedger(finalCommittedState)
 
-                // 4. Verify read back
+                // 4. Atomically commit the final ledger JSON ONCE using verified permanent paths
+                store.writeState(finalCommittedState)
+
+                // 5. Verify that restored records can be read back successfully
                 val readBack = store.readState()
-                if (readBack.entries.size != interimState.entries.size || readBack.people.size != interimState.people.size) {
+                if (readBack.entries.size != finalCommittedState.entries.size || readBack.people.size != finalCommittedState.people.size) {
                     throw IllegalStateException("Verification failed: written records do not match imported backup")
                 }
 
-                // 5. Write and verification succeeded! Now safely commit photos into permanent people-photos directory
-                val permanentPhotosFolder = File(filesDir, "people-photos").apply { mkdirs() }
-                val finalPeople = interimState.people.map { person ->
-                    if (!person.photoPath.isNullOrBlank() && person.photoPath.startsWith(stagingPhotosDir.absolutePath)) {
-                        val targetPhotoFile = File(permanentPhotosFolder, "${person.id}.jpg")
-                        File(person.photoPath).copyTo(targetPhotoFile, overwrite = true)
-                        person.copy(photoPath = targetPhotoFile.absolutePath)
-                    } else {
-                        person
-                    }
-                }
-                stagingPhotosDir.deleteRecursively()
-
-                val finalCommittedState = interimState.copy(people = finalPeople)
-                store.writeState(finalCommittedState)
-
-                // 6. Clean up temporary preview staging
-                preview.stagingDir?.deleteRecursively()
-
+                // 6. Restoration succeeded!
+                restoreSucceeded = true
                 _uiState.value = LedgerUiState.Ready(finalCommittedState)
                 Result.success(finalCommittedState)
             } catch (t: Throwable) {
-                // Failure occurred! Roll back both ledger JSON and all profile photos
+                // Failure occurred! Roll back both ledger JSON and all profile photos from snapshot
                 if (snapshotFolder != null && snapshotFolder.exists()) {
                     BackupManager.rollbackPreRestoreSnapshot(filesDir, snapshotFolder)
                 }
-                stagingPhotosDir?.deleteRecursively()
-                preview.stagingDir?.deleteRecursively()
+                newlyCreatedPermanentFiles.forEach { file ->
+                    runCatching { file.delete() }
+                }
                 Result.failure(t)
+            } finally {
+                // Ensure temporary preview files are always cleaned up
+                preview.stagingDir?.deleteRecursively()
+                if (!restoreSucceeded) {
+                    newlyCreatedPermanentFiles.forEach { file ->
+                        runCatching { file.delete() }
+                    }
+                }
             }
         }
     }
