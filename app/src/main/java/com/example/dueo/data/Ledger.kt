@@ -18,7 +18,8 @@ data class Entry(
     val note: String = "",
     val date: Long = System.currentTimeMillis(),
     val personId: String = "",
-    val dueDate: Long? = null
+    val dueDate: Long? = null,
+    val clientOperationId: String? = null
 )
 
 data class Balance(val receive: Long = 0, val pay: Long = 0)

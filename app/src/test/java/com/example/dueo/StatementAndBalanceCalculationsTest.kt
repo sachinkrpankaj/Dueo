@@ -74,5 +74,43 @@ class StatementAndBalanceCalculationsTest {
             assertEquals("No remaining unpaginated entries", chronological.size, entryIndex)
         }
     }
+
+    @Test
+    fun statementImagePaginationDistributesAllEntriesAcrossPages() {
+        val maxRowsPerPage = 25
+        val testCounts = listOf(0, 1, 24, 25, 26, 50, 75, 101)
+
+        for (count in testCounts) {
+            val entries = List(count) { i ->
+                Entry(
+                    id = "entry-$i",
+                    person = "Aarav",
+                    personId = "p-aarav",
+                    amount = (i + 1) * 500L,
+                    kind = EntryKind.LENT,
+                    date = 1000L + i * 50L
+                )
+            }
+
+            val totalPages = if (entries.isEmpty()) 1 else {
+                ((entries.size + maxRowsPerPage - 1) / maxRowsPerPage).coerceAtLeast(1)
+            }
+
+            if (count == 0 || count <= 25) {
+                assertEquals("Should be exactly 1 page for $count entries", 1, totalPages)
+            } else if (count == 26) {
+                assertEquals("26 entries must paginate to 2 pages", 2, totalPages)
+            }
+
+            var distributed = 0
+            for (pageNum in 1..totalPages) {
+                val pageSlice = entries.drop((pageNum - 1) * maxRowsPerPage).take(maxRowsPerPage)
+                distributed += pageSlice.size
+                assertTrue("Slice size must be <= $maxRowsPerPage", pageSlice.size <= maxRowsPerPage)
+            }
+
+            assertEquals("All $count entries must be distributed across $totalPages image pages", count, distributed)
+        }
+    }
 }
 

@@ -276,14 +276,14 @@ fun DueoApp() {
                                         )
                                     },
                                     onShareStatementImage = {
-                                        viewModel.shareStatementImage(
+                                        viewModel.shareStatementImages(
                                             person = selectedProfile,
                                             entries = entries.filter { it.personId == selectedProfile.id },
-                                            onSuccess = { uri ->
-                                                StatementSharer.shareImage(context, uri, "Share statement (Image)", "Dueo transaction statement for ${selectedProfile.name}")
+                                            onSuccess = { uris ->
+                                                StatementSharer.shareImages(context, uris, "Share statement (Images)", "Dueo transaction statement for ${selectedProfile.name}")
                                             },
                                             onError = { e ->
-                                                scope.launch { snackbar.showSnackbar("Unable to generate statement image: ${e.message}") }
+                                                scope.launch { snackbar.showSnackbar("Unable to generate statement images: ${e.message}") }
                                             }
                                         )
                                     }

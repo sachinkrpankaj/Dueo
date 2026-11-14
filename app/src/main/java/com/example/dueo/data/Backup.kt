@@ -37,8 +37,31 @@ class InvalidBackupException(message: String, cause: Throwable? = null) : Illega
 
 object BackupManager {
 
-    private const val MAX_UNCOMPRESSED_BYTES = 100L * 1024L * 1024L // 100 MB safety limit against zip bombs
-    private const val MAX_ENTRIES_COUNT = 2000
+    const val MAX_JSON_FILE_BYTES = 10L * 1024L * 1024L // 10 MB maximum for JSON backup files
+    const val MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES = 25L * 1024L * 1024L // 25 MB max total uncompressed ZIP
+    const val MAX_IMAGE_FILE_BYTES = 5L * 1024L * 1024L // 5 MB max per image
+    const val MAX_ZIP_ENTRIES_COUNT = 500
+
+    private val ID_REGEX = Regex("^[a-zA-Z0-9_-]{1,64}$")
+    private val IMAGE_ENTRY_REGEX = Regex("^images/[a-zA-Z0-9_-]{1,64}\\.(jpg|jpeg|png)$")
+
+    /**
+     * Reads an InputStream up to maxBytes. Throws InvalidBackupException if stream exceeds the limit.
+     */
+    fun readBoundedStream(inputStream: InputStream, maxBytes: Long): ByteArray {
+        val baos = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var totalBytes = 0L
+        var read: Int
+        while (inputStream.read(buffer).also { read = it } != -1) {
+            totalBytes += read
+            if (totalBytes > maxBytes) {
+                throw InvalidBackupException("Backup file exceeds maximum allowed size of ${maxBytes / (1024 * 1024)} MB")
+            }
+            baos.write(buffer, 0, read)
+        }
+        return baos.toByteArray()
+    }
 
     /**
      * Exports a portable, versioned ZIP backup (.dueobak) containing:
@@ -97,6 +120,9 @@ object BackupManager {
                 if (e.dueDate != null) {
                     put("dueDate", e.dueDate)
                 }
+                if (!e.clientOperationId.isNullOrBlank()) {
+                    put("clientOperationId", e.clientOperationId)
+                }
             })
         }
 
@@ -150,7 +176,7 @@ object BackupManager {
 
     /**
      * Inspects a backup stream (either ZIP or legacy JSON) without modifying application data.
-     * Validates format, app identifier, schema version, and all financial rules.
+     * Validates format, app identifier, schema version, path safety, and all financial rules.
      * Returns a BackupPreview describing the backup contents.
      */
     fun inspectBackup(
@@ -187,7 +213,7 @@ object BackupManager {
         var ledgerText: String? = null
         val extractedPhotos = mutableMapOf<String, File>()
 
-        var totalBytesRead = 0L
+        var totalDecompressedBytes = 0L
         var entriesCount = 0
 
         val zipIn = ZipInputStream(inputStream)
@@ -195,36 +221,32 @@ object BackupManager {
             var entry: ZipEntry? = zipIn.nextEntry
             while (entry != null) {
                 entriesCount++
-                if (entriesCount > MAX_ENTRIES_COUNT) {
-                    throw InvalidBackupException("Backup archive exceeds maximum entry limit ($MAX_ENTRIES_COUNT)")
+                if (entriesCount > MAX_ZIP_ENTRIES_COUNT) {
+                    throw InvalidBackupException("Backup archive exceeds maximum entry limit ($MAX_ZIP_ENTRIES_COUNT)")
                 }
 
                 val entryName = entry.name.replace('\\', '/')
-                // Reject Zip Slip / Path Traversal attempts
-                if (entryName.startsWith("/") || entryName.contains(":") || entryName.split("/").contains("..")) {
+
+                // Strict path traversal / zip slip check
+                if (entryName.startsWith("/") || entryName.contains(":") || entryName.split("/").contains("..") || entryName.contains("\u0000")) {
                     throw SecurityException("Illegal ZIP entry path: ${entry.name}")
                 }
 
+                // Strict whitelist of permitted file structures in container
+                if (entryName != "manifest.json" && entryName != "ledger.json" && !entryName.matches(IMAGE_ENTRY_REGEX)) {
+                    throw SecurityException("Unauthorized or malformed entry in backup archive: $entryName")
+                }
+
                 if (entryName == "manifest.json") {
-                    val baos = ByteArrayOutputStream()
-                    val buffer = ByteArray(4096)
-                    var len: Int
-                    while (zipIn.read(buffer).also { len = it } != -1) {
-                        totalBytesRead += len
-                        if (totalBytesRead > MAX_UNCOMPRESSED_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
-                        baos.write(buffer, 0, len)
-                    }
-                    manifestText = baos.toString(Charsets.UTF_8.name())
+                    val bytes = readBoundedEntry(zipIn, 1024L * 1024L) // 1 MB limit for manifest
+                    totalDecompressedBytes += bytes.size
+                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+                    manifestText = String(bytes, Charsets.UTF_8)
                 } else if (entryName == "ledger.json") {
-                    val baos = ByteArrayOutputStream()
-                    val buffer = ByteArray(4096)
-                    var len: Int
-                    while (zipIn.read(buffer).also { len = it } != -1) {
-                        totalBytesRead += len
-                        if (totalBytesRead > MAX_UNCOMPRESSED_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
-                        baos.write(buffer, 0, len)
-                    }
-                    ledgerText = baos.toString(Charsets.UTF_8.name())
+                    val bytes = readBoundedEntry(zipIn, MAX_JSON_FILE_BYTES) // 10 MB limit for ledger JSON
+                    totalDecompressedBytes += bytes.size
+                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+                    ledgerText = String(bytes, Charsets.UTF_8)
                 } else if (entryName.startsWith("images/") && !entry.isDirectory) {
                     val filename = entryName.substringAfterLast('/')
                     val destFile = File(stagingDir, filename)
@@ -232,16 +254,14 @@ object BackupManager {
                         throw SecurityException("Zip traversal detected: $entryName")
                     }
 
-                    val fos = FileOutputStream(destFile)
-                    val buffer = ByteArray(4096)
-                    var len: Int
-                    while (zipIn.read(buffer).also { len = it } != -1) {
-                        totalBytesRead += len
-                        if (totalBytesRead > MAX_UNCOMPRESSED_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
-                        fos.write(buffer, 0, len)
-                    }
-                    fos.flush()
-                    fos.close()
+                    val bytes = readBoundedEntry(zipIn, MAX_IMAGE_FILE_BYTES)
+                    totalDecompressedBytes += bytes.size
+                    if (totalDecompressedBytes > MAX_TOTAL_UNCOMPRESSED_ZIP_BYTES) throw SecurityException("Decompressed size exceeds safe limit")
+
+                    // Validate image magic bytes (JPEG or PNG)
+                    validateImageBytes(bytes, entryName)
+
+                    destFile.outputStream().use { it.write(bytes) }
 
                     val personId = filename.substringBeforeLast('.')
                     extractedPhotos[personId] = destFile
@@ -254,26 +274,31 @@ object BackupManager {
             try { zipIn.close() } catch (_: Exception) {}
         }
 
+        if (manifestText.isNullOrBlank()) {
+            stagingDir.deleteRecursively()
+            throw InvalidBackupException("Backup archive is missing required manifest.json")
+        }
+
         if (ledgerText.isNullOrBlank()) {
             stagingDir.deleteRecursively()
-            throw InvalidBackupException("Backup archive is missing ledger.json")
+            throw InvalidBackupException("Backup archive is missing required ledger.json")
         }
 
         // Validate manifest
-        val manifestObj = if (!manifestText.isNullOrBlank()) {
-            try { JSONObject(manifestText) } catch (e: Exception) {
-                stagingDir.deleteRecursively()
-                throw InvalidBackupException("Malformed manifest.json in backup", e)
-            }
-        } else null
+        val manifestObj = try {
+            JSONObject(manifestText)
+        } catch (e: Exception) {
+            stagingDir.deleteRecursively()
+            throw InvalidBackupException("Malformed manifest.json in backup archive", e)
+        }
 
-        val app = manifestObj?.optString("app") ?: "Dueo"
+        val app = manifestObj.optString("app")
         if (app != "Dueo") {
             stagingDir.deleteRecursively()
             throw InvalidBackupException("Unknown application identifier: '$app'. Only 'Dueo' backups are supported.")
         }
 
-        val schemaVersion = manifestObj?.optInt("backupSchemaVersion", 2) ?: 2
+        val schemaVersion = manifestObj.optInt("backupSchemaVersion", -1)
         if (schemaVersion !in 1..2) {
             stagingDir.deleteRecursively()
             throw InvalidBackupException("Unsupported backup schema version: $schemaVersion")
@@ -281,12 +306,34 @@ object BackupManager {
 
         // Parse and validate ledger
         val state = parseAndValidateLedgerJson(ledgerText, stagingDir)
+
+        // Validate that manifest counts strictly match parsed ledger contents
+        val manifestPeople = manifestObj.optInt("peopleCount", -1)
+        val manifestEntries = manifestObj.optInt("entriesCount", -1)
+        if (manifestPeople >= 0 && manifestPeople != state.people.size) {
+            stagingDir.deleteRecursively()
+            throw InvalidBackupException("Manifest people count ($manifestPeople) does not match ledger contents (${state.people.size})")
+        }
+        if (manifestEntries >= 0 && manifestEntries != state.entries.size) {
+            stagingDir.deleteRecursively()
+            throw InvalidBackupException("Manifest entries count ($manifestEntries) does not match ledger contents (${state.entries.size})")
+        }
+
+        // Validate person ID format and that all images belong to existing people
+        val personIds = state.people.map { it.id }.toSet()
+        for (personId in extractedPhotos.keys) {
+            if (!personIds.contains(personId)) {
+                stagingDir.deleteRecursively()
+                throw SecurityException("Backup contains unreferenced profile image for unknown person ID: '$personId'")
+            }
+        }
+
         val balance = state.entries.balance()
 
         return BackupPreview(
             app = app,
             schemaVersion = schemaVersion,
-            exportedAt = manifestObj?.optLong("exportedAt") ?: System.currentTimeMillis(),
+            exportedAt = manifestObj.optLong("exportedAt", System.currentTimeMillis()),
             peopleCount = state.people.size,
             entriesCount = state.entries.size,
             photosCount = extractedPhotos.size,
@@ -301,8 +348,35 @@ object BackupManager {
         )
     }
 
+    private fun validateImageBytes(bytes: ByteArray, entryName: String) {
+        if (bytes.size < 4) {
+            throw SecurityException("Malformed image in backup '$entryName': file too small")
+        }
+        val isJpeg = bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()
+        val isPng = bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
+        if (!isJpeg && !isPng) {
+            throw SecurityException("Unsafe or invalid image content in backup '$entryName': must be a valid JPEG or PNG file")
+        }
+    }
+
+    private fun readBoundedEntry(zipIn: ZipInputStream, maxEntryBytes: Long): ByteArray {
+        val baos = ByteArrayOutputStream()
+        val buffer = ByteArray(4096)
+        var total = 0L
+        var len: Int
+        while (zipIn.read(buffer).also { len = it } != -1) {
+            total += len
+            if (total > maxEntryBytes) {
+                throw SecurityException("ZIP entry exceeds maximum safe size of ${maxEntryBytes / (1024 * 1024)} MB")
+            }
+            baos.write(buffer, 0, len)
+        }
+        return baos.toByteArray()
+    }
+
     private fun inspectJsonBackup(inputStream: InputStream): BackupPreview {
-        val rawJson = inputStream.bufferedReader().use { it.readText() }
+        val rawBytes = readBoundedStream(inputStream, MAX_JSON_FILE_BYTES)
+        val rawJson = String(rawBytes, Charsets.UTF_8)
         if (rawJson.trim().isEmpty()) {
             throw InvalidBackupException("Backup file is empty")
         }
@@ -353,8 +427,12 @@ object BackupManager {
 
             val people = List(peopleArray.length()) { i ->
                 val obj = peopleArray.getJSONObject(i)
+                val id = obj.getString("id")
+                if (!id.matches(ID_REGEX)) {
+                    throw InvalidBackupException("Person ID '$id' contains invalid characters. Must be alphanumeric or hyphens/underscores.")
+                }
                 Person(
-                    id = obj.getString("id"),
+                    id = id,
                     name = obj.getString("name"),
                     phone = obj.optString("phone"),
                     photoPath = obj.optString("photoPath").takeIf { it.isNotBlank() }
@@ -367,6 +445,10 @@ object BackupManager {
                     row.getLong("dueDate").takeIf { it > 0 }
                 } else null
 
+                val clientOpId = if (row.has("clientOperationId") && !row.isNull("clientOperationId")) {
+                    row.getString("clientOperationId").takeIf { it.isNotBlank() }
+                } else null
+
                 Entry(
                     id = row.getString("id"),
                     person = row.getString("person"),
@@ -375,7 +457,8 @@ object BackupManager {
                     kind = EntryKind.valueOf(row.getString("kind")),
                     note = row.optString("note", ""),
                     date = row.getLong("date"),
-                    dueDate = dueDate
+                    dueDate = dueDate,
+                    clientOperationId = clientOpId
                 )
             }
 
@@ -390,31 +473,70 @@ object BackupManager {
     }
 
     /**
-     * Creates a recoverable pre-restore safety snapshot of the current persistent ledger file.
-     * Stored in filesDir/pre_restore_snapshots/snapshot-<timestamp>.json.
+     * Creates a recoverable pre-restore safety snapshot of the current persistent ledger file
+     * and all existing profile photos.
+     * Returns the snapshot folder File.
      */
     fun createPreRestoreSnapshot(filesDir: File): File? {
         val ledgerFile = File(filesDir, "ledger-v2.json")
-        if (!ledgerFile.exists()) return null
+        if (!ledgerFile.exists() || ledgerFile.length() == 0L) return null
 
         val snapshotsDir = File(filesDir, "pre_restore_snapshots").apply { mkdirs() }
-        val snapshotFile = File(snapshotsDir, "snapshot-${System.currentTimeMillis()}.json")
-        ledgerFile.copyTo(snapshotFile, overwrite = true)
+        val snapshotFolder = File(snapshotsDir, "snapshot_${System.currentTimeMillis()}").apply { mkdirs() }
+
+        // 1. Snapshot ledger-v2.json
+        val ledgerDest = File(snapshotFolder, "ledger-v2.json")
+        ledgerFile.copyTo(ledgerDest, overwrite = true)
+
+        // 2. Snapshot people-photos directory
+        val photosDir = File(filesDir, "people-photos")
+        if (photosDir.exists() && photosDir.isDirectory) {
+            val photosDest = File(snapshotFolder, "people-photos").apply { mkdirs() }
+            photosDir.listFiles()?.forEach { photo ->
+                if (photo.isFile) {
+                    photo.copyTo(File(photosDest, photo.name), overwrite = true)
+                }
+            }
+        }
 
         // Prune old snapshots, retaining the newest 10
         pruneSnapshots(snapshotsDir, keepCount = 10)
-        return snapshotFile
+        return snapshotFolder
+    }
+
+    /**
+     * Reverts all financial records and profile photos to the safety snapshot if restoration fails.
+     */
+    fun rollbackPreRestoreSnapshot(filesDir: File, snapshotFolder: File) {
+        runCatching {
+            // 1. Revert ledger-v2.json
+            val snapshotLedger = File(snapshotFolder, "ledger-v2.json")
+            val targetLedger = File(filesDir, "ledger-v2.json")
+            val targetBak = File(filesDir, "ledger-v2.json.bak")
+            targetBak.delete()
+            if (snapshotLedger.exists()) {
+                snapshotLedger.copyTo(targetLedger, overwrite = true)
+            }
+
+            // 2. Revert people-photos
+            val snapshotPhotos = File(snapshotFolder, "people-photos")
+            if (snapshotPhotos.exists() && snapshotPhotos.isDirectory) {
+                val targetPhotos = File(filesDir, "people-photos").apply { mkdirs() }
+                snapshotPhotos.listFiles()?.forEach { photo ->
+                    photo.copyTo(File(targetPhotos, photo.name), overwrite = true)
+                }
+            }
+        }
     }
 
     private fun pruneSnapshots(snapshotsDir: File, keepCount: Int) {
         runCatching {
-            val files = snapshotsDir.listFiles { file -> file.name.startsWith("snapshot-") } ?: return@runCatching
-            if (files.size > keepCount) {
-                files.sortedBy { it.lastModified() }
-                    .take(files.size - keepCount)
-                    .forEach { it.delete() }
+            val folders = snapshotsDir.listFiles { file -> file.isDirectory && file.name.startsWith("snapshot_") } ?: return@runCatching
+            if (folders.size > keepCount) {
+                folders.sortedBy { it.lastModified() }
+                    .take(folders.size - keepCount)
+                    .forEach { it.deleteRecursively() }
             }
         }
     }
 }
-

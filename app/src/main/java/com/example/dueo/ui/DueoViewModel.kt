@@ -292,6 +292,29 @@ class DueoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * Generates detailed, paginated statement images asynchronously off the main thread.
+     */
+    fun shareStatementImages(
+        person: Person,
+        entries: List<Entry>,
+        onSuccess: (List<Uri>) -> Unit,
+        onError: (Throwable) -> Unit
+    ) {
+        if (isGeneratingShare) return
+        isGeneratingShare = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val uris = StatementSharer.generateStatementImages(getApplication(), person, entries)
+                withContext(Dispatchers.Main) { onSuccess(uris) }
+            } catch (t: Throwable) {
+                withContext(Dispatchers.Main) { onError(t) }
+            } finally {
+                withContext(Dispatchers.Main) { isGeneratingShare = false }
+            }
+        }
+    }
+
+    /**
      * Generates a statement image asynchronously off the main thread.
      */
     fun shareStatementImage(
@@ -300,18 +323,12 @@ class DueoViewModel(application: Application) : AndroidViewModel(application) {
         onSuccess: (Uri) -> Unit,
         onError: (Throwable) -> Unit
     ) {
-        if (isGeneratingShare) return
-        isGeneratingShare = true
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val uri = StatementSharer.generateStatementImage(getApplication(), person, entries)
-                withContext(Dispatchers.Main) { onSuccess(uri) }
-            } catch (t: Throwable) {
-                withContext(Dispatchers.Main) { onError(t) }
-            } finally {
-                withContext(Dispatchers.Main) { isGeneratingShare = false }
-            }
-        }
+        shareStatementImages(
+            person = person,
+            entries = entries,
+            onSuccess = { uris -> onSuccess(uris.first()) },
+            onError = onError
+        )
     }
 
     fun restoreFromJson(

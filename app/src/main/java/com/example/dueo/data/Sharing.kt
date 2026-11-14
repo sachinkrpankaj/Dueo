@@ -182,107 +182,155 @@ object StatementSharer {
     }
 
     /**
-     * Generates a detailed statement image containing all chronological transactions without omission.
-     * Dynamically sizes canvas height based on the total transaction count.
+     * Generates detailed, paginated statement images so that no transactions are missing or cut off.
+     * Uses clean pagination whenever the history exceeds standard page dimensions, preventing memory issues
+     * and graphical clipping.
+     */
+    fun generateStatementImages(context: Context, person: Person, entries: List<Entry>): List<Uri> {
+        val chronological = entries.sortedBy { it.date }
+        val balance = entries.balance()
+        val width = 1080
+        val rowHeight = 70
+        val maxRowsPerPage = 25
+        val dateFormat = SimpleDateFormat("dd MMM yyyy", Locale.getDefault())
+
+        val totalPages = if (chronological.isEmpty()) 1 else {
+            ((chronological.size + maxRowsPerPage - 1) / maxRowsPerPage).coerceAtLeast(1)
+        }
+
+        val uris = mutableListOf<Uri>()
+        var entryIndex = 0
+
+        for (pageNum in 1..totalPages) {
+            val isFirstPage = (pageNum == 1)
+            val isLastPage = (pageNum == totalPages)
+            val pageEntries = chronological.drop(entryIndex).take(maxRowsPerPage)
+            entryIndex += pageEntries.size
+
+            val headerHeight = if (isFirstPage) 240 else 100
+            val tableHeadHeight = 70
+            val entriesHeight = pageEntries.size * rowHeight
+            val summaryHeight = if (isLastPage) 200 else 0
+            val footerHeight = 70
+            val totalHeight = (headerHeight + tableHeadHeight + entriesHeight + summaryHeight + footerHeight).coerceAtLeast(800)
+
+            val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(0xFFF7F8FC.toInt())
+
+            var y = 0f
+
+            if (isFirstPage) {
+                // Branded Header (Page 1)
+                val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5642CC.toInt() }
+                canvas.drawRect(0f, 0f, width.toFloat(), 240f, headerPaint)
+
+                val whiteBrandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    textSize = 52f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+                val whiteSubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = 0xFFDDD6FE.toInt()
+                    textSize = 28f
+                }
+                canvas.drawText("dueo", 60f, 90f, whiteBrandPaint)
+                canvas.drawText("Statement of Account · ${person.name}", 60f, 145f, whiteSubPaint)
+                canvas.drawText("Generated on ${dateFormat.format(Date())}", 60f, 195f, whiteSubPaint)
+                y = 290f
+            } else {
+                // Compact Header (Page 2+)
+                val compHeaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5642CC.toInt() }
+                canvas.drawRect(0f, 0f, width.toFloat(), 100f, compHeaderPaint)
+                val compWhitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    textSize = 32f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+                canvas.drawText("dueo · Statement of Account · ${person.name}", 60f, 65f, compWhitePaint)
+                y = 150f
+            }
+
+            // Table Header
+            val tableHeadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF727187.toInt()
+                textSize = 26f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+            canvas.drawText("DATE", 60f, y, tableHeadPaint)
+            canvas.drawText("DESCRIPTION / NOTE", 230f, y, tableHeadPaint)
+            canvas.drawText("TYPE", 660f, y, tableHeadPaint)
+            val amountHeadPaint = Paint(tableHeadPaint).apply { textAlign = Paint.Align.RIGHT }
+            canvas.drawText("AMOUNT", width - 60f, y, amountHeadPaint)
+
+            val dividerPaint = Paint().apply { color = 0xFFE2E4EE.toInt(); strokeWidth = 2f }
+            canvas.drawLine(60f, y + 15f, width - 60f, y + 15f, dividerPaint)
+            y += 50f
+
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF202039.toInt(); textSize = 26f }
+            val notePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF555566.toInt(); textSize = 25f }
+            val rightTextPaint = Paint(textPaint).apply {
+                textAlign = Paint.Align.RIGHT
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            }
+
+            val maxNoteWidth = 410f
+            for (e in pageEntries) {
+                val dateStr = dateFormat.format(Date(e.date))
+                canvas.drawText(dateStr, 60f, y, textPaint)
+
+                val rawNote = if (e.note.isNotBlank()) e.note else e.kind.label
+                val noteStr = if (notePaint.measureText(rawNote) > maxNoteWidth) {
+                    var cut = rawNote.length
+                    while (cut > 0 && notePaint.measureText(rawNote.take(cut) + "…") > maxNoteWidth) cut--
+                    rawNote.take(cut) + "…"
+                } else rawNote
+
+                canvas.drawText(noteStr, 230f, y, notePaint)
+                canvas.drawText(e.kind.name, 660f, y, textPaint)
+                canvas.drawText(money(e.amount), width - 60f, y, rightTextPaint)
+
+                y += 25f
+                canvas.drawLine(60f, y, width - 60f, y, dividerPaint)
+                y += 45f
+            }
+
+            // Summary box on final page
+            if (isLastPage) {
+                val sumBox = RectF(60f, y + 10f, width - 60f, y + 170f)
+                val sumBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+                canvas.drawRoundRect(sumBox, 24f, 24f, sumBoxPaint)
+
+                canvas.drawText("Summary of Outstanding Balances", 90f, y + 60f, tableHeadPaint)
+                val balStr = "They owe: ${money(balance.receive)}    |    You owe: ${money(balance.pay)}    |    Net: ${money(balance.net())}"
+                canvas.drawText(balStr, 90f, y + 115f, textPaint)
+                y += 190f
+            }
+
+            // Running Footer
+            val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF9999AA.toInt(); textSize = 24f }
+            val pageStr = if (totalPages > 1) {
+                if (isLastPage) "Page $pageNum of $totalPages · Complete record" else "Page $pageNum of $totalPages · Continued on next page"
+            } else {
+                "Personal record generated by Dueo. Please verify all entries."
+            }
+            canvas.drawText(pageStr, 60f, totalHeight - 25f, footerPaint)
+
+            val file = File(getSharedDir(context), "dueo-statement-p${pageNum}-${UUID.randomUUID()}.png")
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            uris.add(FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file))
+        }
+
+        return uris
+    }
+
+    /**
+     * Backward-compatible statement image generator. Returns the first page URI.
      */
     fun generateStatementImage(context: Context, person: Person, entries: List<Entry>): Uri {
-        val chronological = entries.sortedBy { it.date }
-        val width = 1080
-        val rowHeight = 85
-        val baseHeaderHeight = 250
-        val tableHeadHeight = 80
-        val summaryBoxHeight = 220
-        val padding = 60
-
-        val totalHeight = (baseHeaderHeight + tableHeadHeight + (chronological.size * rowHeight) + summaryBoxHeight + padding)
-            .coerceIn(900, 16000)
-
-        val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-
-        // Background
-        canvas.drawColor(0xFFF7F8FC.toInt())
-
-        // Header Card
-        val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5642CC.toInt() }
-        canvas.drawRect(0f, 0f, width.toFloat(), 240f, headerPaint)
-
-        val whiteBrandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = 52f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        }
-        val whiteSubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFDDD6FE.toInt()
-            textSize = 28f
-        }
-        canvas.drawText("dueo", 60f, 90f, whiteBrandPaint)
-        canvas.drawText("Statement of Account · ${person.name}", 60f, 145f, whiteSubPaint)
-        val dateFormat = SimpleDateFormat("dd MMM yyyy", Locale.getDefault())
-        canvas.drawText("Generated on ${dateFormat.format(Date())}", 60f, 195f, whiteSubPaint)
-
-        // Table Header
-        var y = 290f
-        val tableHeadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFF727187.toInt()
-            textSize = 26f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        }
-        canvas.drawText("DATE", 60f, y, tableHeadPaint)
-        canvas.drawText("DESCRIPTION / NOTE", 230f, y, tableHeadPaint)
-        canvas.drawText("TYPE", 660f, y, tableHeadPaint)
-        val amountHeadPaint = Paint(tableHeadPaint).apply { textAlign = Paint.Align.RIGHT }
-        canvas.drawText("AMOUNT", width - 60f, y, amountHeadPaint)
-
-        val dividerPaint = Paint().apply { color = 0xFFE2E4EE.toInt(); strokeWidth = 2f }
-        canvas.drawLine(60f, y + 15f, width - 60f, y + 15f, dividerPaint)
-        y += 55f
-
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF202039.toInt(); textSize = 28f }
-        val notePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF555566.toInt(); textSize = 26f }
-        val rightTextPaint = Paint(textPaint).apply {
-            textAlign = Paint.Align.RIGHT
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        }
-
-        // Render every transaction without artificial truncation
-        val maxNoteWidth = 410f
-        for (e in chronological) {
-            val dateStr = dateFormat.format(Date(e.date))
-            canvas.drawText(dateStr, 60f, y, textPaint)
-
-            val rawNote = if (e.note.isNotBlank()) e.note else e.kind.label
-            val noteStr = if (notePaint.measureText(rawNote) > maxNoteWidth) {
-                var cut = rawNote.length
-                while (cut > 0 && notePaint.measureText(rawNote.take(cut) + "…") > maxNoteWidth) cut--
-                rawNote.take(cut) + "…"
-            } else rawNote
-
-            canvas.drawText(noteStr, 230f, y, notePaint)
-            canvas.drawText(e.kind.name, 660f, y, textPaint)
-            canvas.drawText(money(e.amount), width - 60f, y, rightTextPaint)
-
-            y += 30f
-            canvas.drawLine(60f, y, width - 60f, y, dividerPaint)
-            y += 55f
-        }
-
-        // Summary box
-        val balance = entries.balance()
-        val sumBox = RectF(60f, y + 10f, width - 60f, y + 170f)
-        val sumBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-        canvas.drawRoundRect(sumBox, 24f, 24f, sumBoxPaint)
-
-        canvas.drawText("Summary of Outstanding Balances", 90f, y + 60f, tableHeadPaint)
-        val balStr = "They owe: ${money(balance.receive)}    |    You owe: ${money(balance.pay)}    |    Net: ${money(balance.net())}"
-        canvas.drawText(balStr, 90f, y + 115f, textPaint)
-
-        val file = File(getSharedDir(context), "dueo-statement-${UUID.randomUUID()}.png")
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-        }
-
-        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        return generateStatementImages(context, person, entries).first()
     }
 
     /**
@@ -302,7 +350,7 @@ object StatementSharer {
         // Determine pagination
         val page1Capacity = 16
         val subsequentCapacity = 24
-        val totalPages = if (chronological.size <= page1Capacity) 1 else {
+        val totalPages = if (chronological.isEmpty() || chronological.size <= page1Capacity) 1 else {
             1 + ((chronological.size - page1Capacity + subsequentCapacity - 1) / subsequentCapacity)
         }
 
@@ -451,6 +499,30 @@ object StatementSharer {
             putExtra(Intent.EXTRA_TEXT, textMessage)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        val chooser = Intent.createChooser(intent, title).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(chooser)
+    }
+
+    /**
+     * Shares multiple paginated statement image URIs using the Android system Sharesheet.
+     */
+    fun shareImages(context: Context, uris: List<Uri>, title: String, textMessage: String) {
+        val intent = if (uris.size <= 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                if (uris.isNotEmpty()) putExtra(Intent.EXTRA_STREAM, uris.first())
+                putExtra(Intent.EXTRA_TEXT, textMessage)
+            }
+        } else {
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "image/png"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                putExtra(Intent.EXTRA_TEXT, textMessage)
+            }
+        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         val chooser = Intent.createChooser(intent, title).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }

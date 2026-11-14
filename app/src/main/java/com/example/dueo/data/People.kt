@@ -31,12 +31,26 @@ data class LedgerState(
 class SafeAtomicFile(val baseFile: File) {
     val backupFile = File(baseFile.path + ".bak")
 
-    fun exists(): Boolean = baseFile.exists() || backupFile.exists()
+    fun exists(): Boolean = (baseFile.exists() && baseFile.length() > 0L) || (backupFile.exists() && backupFile.length() > 0L)
 
     fun openRead(): InputStream {
-        if (backupFile.exists()) {
-            baseFile.delete()
-            backupFile.renameTo(baseFile)
+        if (backupFile.exists() && backupFile.length() > 0L) {
+            if (!baseFile.exists() || baseFile.length() == 0L) {
+                baseFile.delete()
+                if (!backupFile.renameTo(baseFile)) {
+                    runCatching {
+                        backupFile.copyTo(baseFile, overwrite = true)
+                        backupFile.delete()
+                    }
+                }
+            } else {
+                backupFile.delete()
+            }
+        }
+        if (baseFile.exists() && baseFile.length() > 0L) {
+            return baseFile.inputStream()
+        } else if (backupFile.exists() && backupFile.length() > 0L) {
+            return backupFile.inputStream()
         }
         return baseFile.inputStream()
     }
@@ -47,8 +61,8 @@ class SafeAtomicFile(val baseFile: File) {
             parent.mkdirs()
         }
 
-        if (baseFile.exists()) {
-            if (!backupFile.exists()) {
+        if (baseFile.exists() && baseFile.length() > 0L) {
+            if (!backupFile.exists() || backupFile.length() == 0L) {
                 if (!baseFile.renameTo(backupFile)) {
                     baseFile.copyTo(backupFile, overwrite = true)
                     baseFile.delete()
@@ -56,12 +70,16 @@ class SafeAtomicFile(val baseFile: File) {
             } else {
                 baseFile.delete()
             }
+        } else if (baseFile.exists()) {
+            baseFile.delete()
         }
 
         return try {
             FileOutputStream(baseFile)
         } catch (e: Exception) {
-            backupFile.copyTo(baseFile, overwrite = true)
+            if (backupFile.exists() && backupFile.length() > 0L) {
+                backupFile.copyTo(baseFile, overwrite = true)
+            }
             throw e
         }
     }
@@ -77,7 +95,9 @@ class SafeAtomicFile(val baseFile: File) {
         } finally {
             stream.close()
         }
-        backupFile.delete()
+        if (baseFile.exists() && baseFile.length() > 0L) {
+            backupFile.delete()
+        }
     }
 
     fun failWrite(stream: OutputStream) {
@@ -88,8 +108,10 @@ class SafeAtomicFile(val baseFile: File) {
             stream.close()
         } catch (_: Exception) {}
         baseFile.delete()
-        if (backupFile.exists()) {
-            backupFile.renameTo(baseFile)
+        if (backupFile.exists() && backupFile.length() > 0L) {
+            if (!backupFile.renameTo(baseFile)) {
+                runCatching { backupFile.copyTo(baseFile, overwrite = true) }
+            }
         }
     }
 }
@@ -145,7 +167,13 @@ class LedgerStore(
         try {
             rawText = atomicFile.openRead().bufferedReader().use { it.readText() }
         } catch (fnf: FileNotFoundException) {
-            return loadLegacyOrEmpty()
+            val backup = preserveCorruptedFile(ledgerFile, "missing_after_check")
+            return LedgerLoadResult.RecoverableFailure(
+                message = "Ledger file exists but could not be opened: ${fnf.message}",
+                backupFile = backup,
+                rawContent = null,
+                cause = fnf
+            )
         } catch (ioe: Exception) {
             val backup = preserveCorruptedFile(ledgerFile, "read_error")
             return LedgerLoadResult.RecoverableFailure(
@@ -157,6 +185,16 @@ class LedgerStore(
         }
 
         if (rawText.trim().isEmpty()) {
+            // Check if backupFile exists and has valid data
+            if (atomicFile.backupFile.exists() && atomicFile.backupFile.length() > 0L) {
+                try {
+                    val recoveredText = atomicFile.backupFile.bufferedReader().use { it.readText() }
+                    if (recoveredText.trim().isNotEmpty()) {
+                        atomicFile.backupFile.copyTo(atomicFile.baseFile, overwrite = true)
+                        return loadLedger()
+                    }
+                } catch (_: Exception) {}
+            }
             val backup = preserveCorruptedFile(ledgerFile, "empty_file")
             return LedgerLoadResult.RecoverableFailure(
                 message = "Ledger file exists but is unexpectedly empty",
@@ -296,6 +334,10 @@ class LedgerStore(
             row.getLong("dueDate").takeIf { it > 0 }
         } else null
 
+        val clientOperationId = if (row.has("clientOperationId") && !row.isNull("clientOperationId")) {
+            row.getString("clientOperationId").takeIf { it.isNotBlank() }
+        } else null
+
         return Entry(
             id = row.getString("id"),
             person = row.getString("person"),
@@ -304,7 +346,8 @@ class LedgerStore(
             note = row.optString("note", ""),
             date = row.getLong("date"),
             personId = row.optString("personId", ""),
-            dueDate = dueDate
+            dueDate = dueDate,
+            clientOperationId = clientOperationId
         )
     }
 
@@ -338,6 +381,9 @@ class LedgerStore(
                 put("date", e.date)
                 if (e.dueDate != null) {
                     put("dueDate", e.dueDate)
+                }
+                if (!e.clientOperationId.isNullOrBlank()) {
+                    put("clientOperationId", e.clientOperationId)
                 }
             })
         }

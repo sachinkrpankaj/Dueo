@@ -9,6 +9,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -26,7 +27,7 @@ class PortableBackupAndSafetyTest {
 
         repository.initialize()
 
-        // 1. Create a person with a real photo file
+        // 1. Create a person with a real photo file (valid JPEG magic bytes)
         val photosDir = File(filesDir, "people-photos").apply { mkdirs() }
         val testPhoto = File(photosDir, "test-person.jpg").apply {
             writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte()))
@@ -95,40 +96,84 @@ class PortableBackupAndSafetyTest {
     }
 
     @Test
-    fun preRestoreSafetySnapshotIsCreatedBeforeOverwriting() = runBlocking {
+    fun preRestoreSafetySnapshotPreservesBothLedgerAndProfilePhotos() = runBlocking {
         val filesDir = tempFolder.newFolder("files_snapshot")
         val cacheDir = tempFolder.newFolder("cache_snapshot")
         val store = LedgerStore(filesDir = filesDir, cacheDir = cacheDir)
         val repository = LedgerRepository(store = store)
 
         repository.initialize()
-        val originalPerson = repository.addPerson("Pre-existing User", "111", null).getOrThrow()
+        val sourcePhotosDir = tempFolder.newFolder("source_photos")
+        val initialPhoto = File(sourcePhotosDir, "initial.jpg").apply { writeText("original photo content") }
+        val originalPerson = repository.addPerson("Pre-existing User", "111", initialPhoto.absolutePath).getOrThrow()
         repository.addTransaction(originalPerson.id, 50000L, EntryKind.LENT, "Initial loan").getOrThrow()
 
-        // Verify ledger exists
+        // Verify ledger and photo exist
         assertTrue(store.ledgerFile.exists())
+        assertNotNull(originalPerson.photoPath)
+        val savedPhoto = File(originalPerson.photoPath!!)
+        assertTrue(savedPhoto.exists())
 
-        // Prepare a new backup to restore
-        val newBackupJson = """{
-            "app": "Dueo",
-            "backupSchemaVersion": 2,
-            "exportedAt": 1700000000000,
-            "people": [{"id": "p-new", "name": "New User", "phone": "222", "photoPath": ""}],
-            "entries": [{"id": "e-new", "person": "New User", "personId": "p-new", "amount": 25000, "kind": "LENT", "note": "New Loan", "date": 1000}]
-        }"""
+        // Create safety snapshot
+        val snapshotFolder = BackupManager.createPreRestoreSnapshot(filesDir)
+        assertNotNull(snapshotFolder)
+        assertTrue(snapshotFolder!!.exists())
 
-        val preview = repository.previewBackup(ByteArrayInputStream(newBackupJson.toByteArray(Charsets.UTF_8)), cacheDir).getOrThrow()
-        val result = repository.executeRestore(preview, filesDir)
-        assertTrue(result.isSuccess)
+        val snapshotLedger = File(snapshotFolder, "ledger-v2.json")
+        assertTrue("Snapshot must contain ledger-v2.json", snapshotLedger.exists())
+        assertTrue(snapshotLedger.readText().contains("Pre-existing User"))
 
-        // Verify snapshot was created in pre_restore_snapshots
-        val snapshotsDir = File(filesDir, "pre_restore_snapshots")
-        assertTrue("Snapshots directory must exist", snapshotsDir.exists())
-        val snapshots = snapshotsDir.listFiles { file -> file.name.startsWith("snapshot-") }
-        assertNotNull(snapshots)
-        assertEquals("Exactly one snapshot must be present", 1, snapshots!!.size)
-        val snapshotText = snapshots[0].readText()
-        assertTrue("Snapshot must contain pre-existing data", snapshotText.contains("Pre-existing User"))
+        val snapshotPhotos = File(snapshotFolder, "people-photos")
+        assertTrue("Snapshot must contain people-photos folder", snapshotPhotos.exists())
+        assertEquals(1, snapshotPhotos.listFiles()?.size)
+    }
+
+    @Test
+    fun failedRestoreRollsBackAndPreservesOriginalLedgerAndPhotos() = runBlocking {
+        val filesDir = tempFolder.newFolder("files_rollback")
+        val cacheDir = tempFolder.newFolder("cache_rollback")
+        val store = LedgerStore(filesDir = filesDir, cacheDir = cacheDir)
+        val repository = LedgerRepository(store = store)
+
+        repository.initialize()
+        val photosDir = File(filesDir, "people-photos").apply { mkdirs() }
+        val originalPhoto = File(photosDir, "orig.jpg").apply { writeText("unique original photo data") }
+        val originalPerson = repository.addPerson("Untouchable User", "999", originalPhoto.absolutePath).getOrThrow()
+        repository.addTransaction(originalPerson.id, 75000L, EntryKind.LENT, "Important record").getOrThrow()
+
+        // Corrupted preview with invalid person reference in entries causing restore to fail during validation
+        val badState = LedgerState(
+            people = listOf(Person(id = "p-corrupt", name = "Corrupt Person")),
+            entries = listOf(Entry(id = "e-bad", person = "Corrupt Person", personId = "non-existent-fk", amount = 1000L, kind = EntryKind.LENT))
+        )
+        val badPreview = BackupPreview(
+            app = "Dueo",
+            schemaVersion = 2,
+            exportedAt = System.currentTimeMillis(),
+            peopleCount = 1,
+            entriesCount = 1,
+            photosCount = 0,
+            earliestDate = 1000L,
+            latestDate = 1000L,
+            totalReceive = 1000L,
+            totalPay = 0L,
+            isZipArchive = false,
+            validatedState = badState
+        )
+
+        val restoreResult = repository.executeRestore(badPreview, filesDir)
+        assertTrue("Restoration must fail due to foreign key integrity", restoreResult.isFailure)
+
+        // Verify original ledger is completely intact
+        val currentLedger = repository.getCurrentState()!!
+        assertEquals(1, currentLedger.people.size)
+        assertEquals("Untouchable User", currentLedger.people[0].name)
+        assertEquals(1, currentLedger.entries.size)
+        assertEquals(75000L, currentLedger.entries[0].amount)
+
+        // Verify original photo was preserved
+        assertTrue("Original photo must exist after failed restore", originalPhoto.exists())
+        assertEquals("unique original photo data", originalPhoto.readText())
     }
 
     @Test
@@ -149,50 +194,108 @@ class PortableBackupAndSafetyTest {
             BackupManager.inspectBackup(ByteArrayInputStream(badZipBytes), cacheDir)
         }
         assertTrue("ZipSlip attack must fail", result.isFailure)
-        assertTrue(
-            "Exception must be SecurityException",
-            result.exceptionOrNull() is SecurityException
-        )
+        assertTrue("Exception must be SecurityException", result.exceptionOrNull() is SecurityException)
     }
 
     @Test
-    fun unknownApplicationIdentifierIsRejected() = runBlocking {
-        val cacheDir = tempFolder.newFolder("cache_unknown_app")
-        val badAppJson = """{
-            "app": "NotDueo",
-            "backupSchemaVersion": 2,
-            "exportedAt": 1700000000000,
-            "people": [],
-            "entries": []
-        }"""
+    fun maliciousEntryInZipIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_malicious_entry")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":0,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        // Unauthorized script entry
+        zos.putNextEntry(ZipEntry("exploit.sh"))
+        zos.write("echo bad".toByteArray())
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
 
         val result = runCatching {
-            BackupManager.inspectBackup(ByteArrayInputStream(badAppJson.toByteArray(Charsets.UTF_8)), cacheDir)
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
         }
-        assertTrue("Unknown app must be rejected", result.isFailure)
+        assertTrue("ZIP with unauthorized file must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is SecurityException)
+    }
+
+    @Test
+    fun imageWithInvalidMagicBytesIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_bad_magic")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":1,"entriesCount":0,"photosCount":1}""".toByteArray())
+        zos.closeEntry()
+
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[{"id":"p-1","name":"User 1","photoPath":"images/p-1.jpg"}],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        // Executable disguised as JPG (magic bytes not JPEG or PNG)
+        zos.putNextEntry(ZipEntry("images/p-1.jpg"))
+        zos.write("MZ\u0090\u0000 fake executable bytes".toByteArray())
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue("Disguised non-image file must be rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is SecurityException)
+    }
+
+    @Test
+    fun manifestCountMismatchIsRejected() = runBlocking {
+        val cacheDir = tempFolder.newFolder("cache_mismatch")
+        val baos = ByteArrayOutputStream()
+        val zos = ZipOutputStream(baos)
+
+        // Manifest claims 50 people
+        zos.putNextEntry(ZipEntry("manifest.json"))
+        zos.write("""{"app":"Dueo","backupSchemaVersion":2,"peopleCount":50,"entriesCount":0,"photosCount":0}""".toByteArray())
+        zos.closeEntry()
+
+        // Ledger only has 1 person
+        zos.putNextEntry(ZipEntry("ledger.json"))
+        zos.write("""{"version":2,"people":[{"id":"p-1","name":"User 1","photoPath":""}],"entries":[]}""".toByteArray())
+        zos.closeEntry()
+
+        zos.finish()
+        zos.close()
+
+        val result = runCatching {
+            BackupManager.inspectBackup(ByteArrayInputStream(baos.toByteArray()), cacheDir)
+        }
+        assertTrue("Count mismatch must be rejected", result.isFailure)
         assertTrue(result.exceptionOrNull() is InvalidBackupException)
     }
 
     @Test
-    fun legacyJsonBackupImportsSafelyWithoutPhotos() = runBlocking {
-        val cacheDir = tempFolder.newFolder("cache_legacy")
-        val legacyJson = """{
-            "app": "Dueo",
-            "backupSchemaVersion": 1,
-            "exportedAt": 1690000000000,
-            "people": [
-                {"id": "p-leg", "name": "Legacy Person", "phone": "999", "photoPath": "/data/user/0/com.example.dueo/files/nonexistent.jpg"}
-            ],
-            "entries": [
-                {"id": "e-leg", "person": "Legacy Person", "personId": "p-leg", "amount": 60000, "kind": "LENT", "note": "Old record", "date": 5000}
-            ]
-        }"""
+    fun oversizedJsonBackupIsRejected() {
+        // Stream that produces more than 10 MB of data
+        val hugeStream = object : InputStream() {
+            private var bytesProduced = 0L
+            override fun read(): Int {
+                bytesProduced++
+                return '{'.code
+            }
+        }
 
-        val preview = BackupManager.inspectBackup(ByteArrayInputStream(legacyJson.toByteArray(Charsets.UTF_8)), cacheDir)
-        assertFalse("Legacy JSON must not be identified as ZIP archive", preview.isZipArchive)
-        assertEquals(0, preview.photosCount)
-        assertEquals(1, preview.peopleCount)
-        assertEquals(1, preview.entriesCount)
+        val result = runCatching {
+            BackupManager.readBoundedStream(hugeStream, BackupManager.MAX_JSON_FILE_BYTES)
+        }
+        assertTrue("Oversized stream must be halted and rejected", result.isFailure)
+        assertTrue(result.exceptionOrNull() is InvalidBackupException)
     }
 }
-

@@ -131,16 +131,34 @@ class LedgerRepository(
     ): Result<Entry> = mutex.withLock {
         withContext(ioDispatcher) {
             try {
+                val currentLedger = when (val state = _uiState.value) {
+                    is LedgerUiState.Ready -> state.ledger
+                    else -> store.readState()
+                }
+
+                // Check persistent ledger first for idempotency across app restarts
                 if (!clientOperationId.isNullOrBlank()) {
+                    val existingPersistent = currentLedger.entries.firstOrNull { it.clientOperationId == clientOperationId }
+                    if (existingPersistent != null) {
+                        return@withContext Result.success(existingPersistent)
+                    }
                     val cached = recentOperations[clientOperationId]
                     if (cached != null) {
                         return@withContext Result.success(cached)
                     }
                 }
 
-                val currentLedger = when (val state = _uiState.value) {
-                    is LedgerUiState.Ready -> state.ledger
-                    else -> store.readState()
+                // Check recent submission within 5 seconds with identical parameters to prevent rapid double-saves
+                val trimmedNote = note.trim()
+                val recentDuplicate = currentLedger.entries.lastOrNull {
+                    it.personId == personId &&
+                    it.amount == amount &&
+                    it.kind == kind &&
+                    it.note == trimmedNote &&
+                    Math.abs(it.date - date) < 5_000L
+                }
+                if (recentDuplicate != null) {
+                    return@withContext Result.success(recentDuplicate)
                 }
 
                 val person = currentLedger.people.firstOrNull { it.id == personId }
@@ -152,9 +170,10 @@ class LedgerRepository(
                     personId = person.id,
                     amount = amount,
                     kind = kind,
-                    note = note.trim(),
+                    note = trimmedNote,
                     date = date,
-                    dueDate = dueDate
+                    dueDate = dueDate,
+                    clientOperationId = clientOperationId
                 )
 
                 // Enforce domain validation on prospective state
@@ -257,25 +276,26 @@ class LedgerRepository(
 
     /**
      * Executes a transactional restore from a validated BackupPreview.
-     * Takes an automatic pre-restore safety snapshot of the existing valid ledger,
-     * extracts profile photos safely to filesDir/people-photos, writes and verifies the state.
-     * If any failure occurs, original records are kept intact.
+     * Takes an automatic pre-restore safety snapshot of the existing valid ledger AND existing profile photos.
+     * Stages new photos in isolation until validation and disk commit succeed.
+     * If any failure occurs, original financial records and profile photos are completely rolled back and preserved.
      */
     suspend fun executeRestore(preview: BackupPreview, filesDir: File): Result<LedgerState> = mutex.withLock {
         withContext(ioDispatcher) {
-            var snapshotCreated: File? = null
+            var snapshotFolder: File? = null
+            var stagingPhotosDir: File? = null
             try {
-                // 1. Create safety snapshot of current valid ledger
-                snapshotCreated = BackupManager.createPreRestoreSnapshot(filesDir)
+                // 1. Create safety snapshot of current valid ledger AND all existing profile photos
+                snapshotFolder = BackupManager.createPreRestoreSnapshot(filesDir)
 
-                // 2. Prepare photos directory
-                val photosFolder = File(filesDir, "people-photos").apply { mkdirs() }
+                // 2. Stage extracted photos in an isolated staging folder so existing photos are never touched prematurely
+                stagingPhotosDir = File(filesDir, "staging_photos_${System.currentTimeMillis()}_${UUID.randomUUID()}").apply { mkdirs() }
                 val updatedPeople = preview.validatedState.people.map { person ->
                     val extractedPhoto = preview.extractedPhotos[person.id]
                     if (extractedPhoto != null && extractedPhoto.exists()) {
-                        val destFile = File(photosFolder, "${person.id}.jpg")
-                        extractedPhoto.copyTo(destFile, overwrite = true)
-                        person.copy(photoPath = destFile.absolutePath)
+                        val stagedFile = File(stagingPhotosDir, "${person.id}.jpg")
+                        extractedPhoto.copyTo(stagedFile, overwrite = true)
+                        person.copy(photoPath = stagedFile.absolutePath)
                     } else {
                         // For legacy JSON or absent photos, retain existing local file if valid, else null
                         val existingLocal = if (!person.photoPath.isNullOrBlank() && File(person.photoPath).exists()) {
@@ -285,30 +305,45 @@ class LedgerRepository(
                     }
                 }
 
-                val finalState = preview.validatedState.copy(people = updatedPeople)
-                validator.validateLedger(finalState)
+                val interimState = preview.validatedState.copy(people = updatedPeople)
+                validator.validateLedger(interimState)
 
                 // 3. Atomically write the restored state
-                store.writeState(finalState)
+                store.writeState(interimState)
 
                 // 4. Verify read back
                 val readBack = store.readState()
-                if (readBack.entries.size != finalState.entries.size || readBack.people.size != finalState.people.size) {
+                if (readBack.entries.size != interimState.entries.size || readBack.people.size != interimState.people.size) {
                     throw IllegalStateException("Verification failed: written records do not match imported backup")
                 }
 
-                // 5. Clean up temporary staging
-                preview.stagingDir?.deleteRecursively()
-
-                _uiState.value = LedgerUiState.Ready(finalState)
-                Result.success(finalState)
-            } catch (t: Throwable) {
-                // Rollback if snapshot was created and state was corrupted
-                if (snapshotCreated != null && snapshotCreated.exists()) {
-                    runCatching {
-                        snapshotCreated.copyTo(store.ledgerFile, overwrite = true)
+                // 5. Write and verification succeeded! Now safely commit photos into permanent people-photos directory
+                val permanentPhotosFolder = File(filesDir, "people-photos").apply { mkdirs() }
+                val finalPeople = interimState.people.map { person ->
+                    if (!person.photoPath.isNullOrBlank() && person.photoPath.startsWith(stagingPhotosDir.absolutePath)) {
+                        val targetPhotoFile = File(permanentPhotosFolder, "${person.id}.jpg")
+                        File(person.photoPath).copyTo(targetPhotoFile, overwrite = true)
+                        person.copy(photoPath = targetPhotoFile.absolutePath)
+                    } else {
+                        person
                     }
                 }
+                stagingPhotosDir.deleteRecursively()
+
+                val finalCommittedState = interimState.copy(people = finalPeople)
+                store.writeState(finalCommittedState)
+
+                // 6. Clean up temporary preview staging
+                preview.stagingDir?.deleteRecursively()
+
+                _uiState.value = LedgerUiState.Ready(finalCommittedState)
+                Result.success(finalCommittedState)
+            } catch (t: Throwable) {
+                // Failure occurred! Roll back both ledger JSON and all profile photos
+                if (snapshotFolder != null && snapshotFolder.exists()) {
+                    BackupManager.rollbackPreRestoreSnapshot(filesDir, snapshotFolder)
+                }
+                stagingPhotosDir?.deleteRecursively()
                 preview.stagingDir?.deleteRecursively()
                 Result.failure(t)
             }
@@ -317,20 +352,20 @@ class LedgerRepository(
 
     /**
      * Restores an imported ledger backup safely after complete validation.
-     * Automatically creates a pre-restore safety snapshot before writing.
+     * Automatically creates a pre-restore safety snapshot before writing and rolls back on failure.
      */
     suspend fun restoreLedger(imported: LedgerState): Result<Unit> = mutex.withLock {
         withContext(ioDispatcher) {
-            var snapshot: File? = null
+            var snapshotFolder: File? = null
             try {
                 validator.validateLedger(imported)
-                snapshot = BackupManager.createPreRestoreSnapshot(store.filesDir)
+                snapshotFolder = BackupManager.createPreRestoreSnapshot(store.filesDir)
                 store.writeState(imported)
                 _uiState.value = LedgerUiState.Ready(imported)
                 Result.success(Unit)
             } catch (t: Throwable) {
-                if (snapshot != null && snapshot.exists()) {
-                    runCatching { snapshot.copyTo(store.ledgerFile, overwrite = true) }
+                if (snapshotFolder != null && snapshotFolder.exists()) {
+                    BackupManager.rollbackPreRestoreSnapshot(store.filesDir, snapshotFolder)
                 }
                 Result.failure(t)
             }
