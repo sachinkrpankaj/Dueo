@@ -235,3 +235,4 @@ object FinancialValidator {
         validateLedger(prospectiveLedger)
     }
 }
+

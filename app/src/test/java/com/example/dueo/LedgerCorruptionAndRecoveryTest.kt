@@ -165,3 +165,4 @@ class LedgerCorruptionAndRecoveryTest {
         assertEquals("committed state 1", atomicFile.openRead().bufferedReader().readText())
     }
 }
+

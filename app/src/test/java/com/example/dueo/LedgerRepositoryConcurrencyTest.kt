@@ -152,3 +152,4 @@ class LedgerRepositoryConcurrencyTest {
         assertEquals(2, state!!.entries.size)
     }
 }
+

@@ -140,3 +140,4 @@ class BackupAndExportTest {
         assertTrue("Non-crop file must remain untouched", permanentPhoto.exists())
     }
 }
+

@@ -183,3 +183,4 @@ class FinancialValidatorTest {
         assertEquals(due, entry.dueDate)
     }
 }
+
