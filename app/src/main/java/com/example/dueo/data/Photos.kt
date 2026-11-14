@@ -72,12 +72,26 @@ fun saveCrop(context: Context, bitmap: Bitmap, crop: SquareCrop): String {
 
 /**
  * Safely removes a temporary crop staging file from cacheDir.
- * Never deletes persistent photos referenced by saved profiles in filesDir/people-photos.
+ * Enforces canonical path verification to ensure the file resides strictly within cacheDir
+ * and never deletes persistent photos referenced by saved profiles.
  */
+fun cleanupCropFile(cacheDir: File, path: String?) {
+    if (path.isNullOrBlank()) return
+    runCatching {
+        val file = File(path).canonicalFile
+        val cacheCanonical = cacheDir.canonicalFile
+        if (file.exists() && file.name.startsWith("person-crop-") && file.canonicalPath.startsWith(cacheCanonical.canonicalPath + File.separator)) {
+            file.delete()
+        }
+    }
+}
+
+fun cleanupCropFile(context: Context, path: String?) = cleanupCropFile(context.cacheDir, path)
+
 fun cleanupCropFile(path: String?) {
     if (path.isNullOrBlank()) return
     runCatching {
-        val file = File(path)
+        val file = File(path).canonicalFile
         if (file.exists() && file.name.startsWith("person-crop-")) {
             file.delete()
         }

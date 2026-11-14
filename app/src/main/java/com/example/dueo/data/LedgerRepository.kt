@@ -10,6 +10,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.UUID
 
 sealed interface LedgerUiState {
@@ -42,6 +45,13 @@ class LedgerRepository(
     private val mutex = Mutex()
     private val _uiState = MutableStateFlow<LedgerUiState>(LedgerUiState.Loading)
     val uiState: StateFlow<LedgerUiState> = _uiState.asStateFlow()
+
+    // LRU cache of recent client operations for idempotency
+    private val recentOperations = object : LinkedHashMap<String, Entry>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Entry>?): Boolean {
+            return size > 100
+        }
+    }
 
     suspend fun initialize(): LedgerUiState = mutex.withLock {
         withContext(ioDispatcher) {
@@ -108,6 +118,7 @@ class LedgerRepository(
 
     /**
      * Adds a new transaction atomically after independent financial validation.
+     * Supports an optional clientOperationId for idempotency to protect against double submissions.
      */
     suspend fun addTransaction(
         personId: String,
@@ -115,10 +126,18 @@ class LedgerRepository(
         kind: EntryKind,
         note: String,
         dueDate: Long? = null,
-        date: Long = System.currentTimeMillis()
+        date: Long = System.currentTimeMillis(),
+        clientOperationId: String? = null
     ): Result<Entry> = mutex.withLock {
         withContext(ioDispatcher) {
             try {
+                if (!clientOperationId.isNullOrBlank()) {
+                    val cached = recentOperations[clientOperationId]
+                    if (cached != null) {
+                        return@withContext Result.success(cached)
+                    }
+                }
+
                 val currentLedger = when (val state = _uiState.value) {
                     is LedgerUiState.Ready -> state.ledger
                     else -> store.readState()
@@ -143,6 +162,9 @@ class LedgerRepository(
 
                 val updatedLedger = currentLedger.copy(entries = currentLedger.entries + newEntry)
                 store.writeState(updatedLedger)
+                if (!clientOperationId.isNullOrBlank()) {
+                    recentOperations[clientOperationId] = newEntry
+                }
                 _uiState.value = LedgerUiState.Ready(updatedLedger)
                 Result.success(newEntry)
             } catch (t: Throwable) {
@@ -221,15 +243,112 @@ class LedgerRepository(
     }
 
     /**
+     * Inspects a backup stream (ZIP or JSON) and returns a detailed preview
+     * without altering current state.
+     */
+    suspend fun previewBackup(inputStream: InputStream, stagingParentDir: File): Result<BackupPreview> = withContext(ioDispatcher) {
+        try {
+            val preview = BackupManager.inspectBackup(inputStream, stagingParentDir)
+            Result.success(preview)
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
+    /**
+     * Executes a transactional restore from a validated BackupPreview.
+     * Takes an automatic pre-restore safety snapshot of the existing valid ledger,
+     * extracts profile photos safely to filesDir/people-photos, writes and verifies the state.
+     * If any failure occurs, original records are kept intact.
+     */
+    suspend fun executeRestore(preview: BackupPreview, filesDir: File): Result<LedgerState> = mutex.withLock {
+        withContext(ioDispatcher) {
+            var snapshotCreated: File? = null
+            try {
+                // 1. Create safety snapshot of current valid ledger
+                snapshotCreated = BackupManager.createPreRestoreSnapshot(filesDir)
+
+                // 2. Prepare photos directory
+                val photosFolder = File(filesDir, "people-photos").apply { mkdirs() }
+                val updatedPeople = preview.validatedState.people.map { person ->
+                    val extractedPhoto = preview.extractedPhotos[person.id]
+                    if (extractedPhoto != null && extractedPhoto.exists()) {
+                        val destFile = File(photosFolder, "${person.id}.jpg")
+                        extractedPhoto.copyTo(destFile, overwrite = true)
+                        person.copy(photoPath = destFile.absolutePath)
+                    } else {
+                        // For legacy JSON or absent photos, retain existing local file if valid, else null
+                        val existingLocal = if (!person.photoPath.isNullOrBlank() && File(person.photoPath).exists()) {
+                            person.photoPath
+                        } else null
+                        person.copy(photoPath = existingLocal)
+                    }
+                }
+
+                val finalState = preview.validatedState.copy(people = updatedPeople)
+                validator.validateLedger(finalState)
+
+                // 3. Atomically write the restored state
+                store.writeState(finalState)
+
+                // 4. Verify read back
+                val readBack = store.readState()
+                if (readBack.entries.size != finalState.entries.size || readBack.people.size != finalState.people.size) {
+                    throw IllegalStateException("Verification failed: written records do not match imported backup")
+                }
+
+                // 5. Clean up temporary staging
+                preview.stagingDir?.deleteRecursively()
+
+                _uiState.value = LedgerUiState.Ready(finalState)
+                Result.success(finalState)
+            } catch (t: Throwable) {
+                // Rollback if snapshot was created and state was corrupted
+                if (snapshotCreated != null && snapshotCreated.exists()) {
+                    runCatching {
+                        snapshotCreated.copyTo(store.ledgerFile, overwrite = true)
+                    }
+                }
+                preview.stagingDir?.deleteRecursively()
+                Result.failure(t)
+            }
+        }
+    }
+
+    /**
      * Restores an imported ledger backup safely after complete validation.
+     * Automatically creates a pre-restore safety snapshot before writing.
      */
     suspend fun restoreLedger(imported: LedgerState): Result<Unit> = mutex.withLock {
         withContext(ioDispatcher) {
+            var snapshot: File? = null
             try {
                 validator.validateLedger(imported)
+                snapshot = BackupManager.createPreRestoreSnapshot(store.filesDir)
                 store.writeState(imported)
                 _uiState.value = LedgerUiState.Ready(imported)
                 Result.success(Unit)
+            } catch (t: Throwable) {
+                if (snapshot != null && snapshot.exists()) {
+                    runCatching { snapshot.copyTo(store.ledgerFile, overwrite = true) }
+                }
+                Result.failure(t)
+            }
+        }
+    }
+
+    /**
+     * Exports a portable, versioned ZIP backup (.dueobak) including actual profile photos.
+     */
+    suspend fun exportBackupZip(outputStream: OutputStream, filesDir: File): Result<BackupManifest> = mutex.withLock {
+        withContext(ioDispatcher) {
+            try {
+                val currentLedger = when (val state = _uiState.value) {
+                    is LedgerUiState.Ready -> state.ledger
+                    else -> store.readState()
+                }
+                val manifest = BackupManager.exportBackupZip(currentLedger, outputStream, filesDir)
+                Result.success(manifest)
             } catch (t: Throwable) {
                 Result.failure(t)
             }

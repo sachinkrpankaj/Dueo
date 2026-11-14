@@ -25,6 +25,8 @@ data class Balance(val receive: Long = 0, val pay: Long = 0)
 
 fun List<Entry>.balance(): Balance = FinancialValidator.calculateBalance(this)
 
+fun Balance.net(): Long = FinancialValidator.safeSubtract(receive, pay)
+
 fun parseAmount(text: String): Long? {
     if (!Regex("[0-9]{1,9}(\\.[0-9]{1,2})?").matches(text)) return null
     return runCatching { BigDecimal(text).movePointRight(2).longValueExact() }.getOrNull()?.takeIf { it > 0 }

@@ -24,18 +24,30 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.ViewModelProvider
 import com.example.dueo.R
 import com.example.dueo.data.*
 import com.example.dueo.ui.theme.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DueoApp() {
     val activity = LocalContext.current as? ComponentActivity
     val context = LocalContext.current.applicationContext as Application
-    val viewModel = remember { DueoViewModel(context) }
+    val viewModel = remember(activity) {
+        if (activity != null) {
+            ViewModelProvider(activity, DueoViewModel.factory(context))[DueoViewModel::class.java]
+        } else {
+            DueoViewModel(context)
+        }
+    }
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
 
@@ -84,6 +96,70 @@ fun DueoApp() {
 
     BackHandler(selectedPersonId != null) { selectedPersonId = null }
 
+    // Launcher for exporting damaged ledger file on recovery screen
+    val exportCorruptedLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            val corrupted = uiState as? LedgerUiState.Corrupted
+            if (corrupted != null) {
+                scope.launch {
+                    try {
+                        context.contentResolver.openOutputStream(uri)?.use { stream ->
+                            val bytes = if (!corrupted.rawContent.isNullOrBlank()) {
+                                corrupted.rawContent.toByteArray(Charsets.UTF_8)
+                            } else if (corrupted.backupPath != null) {
+                                File(corrupted.backupPath).readBytes()
+                            } else {
+                                "{}".toByteArray(Charsets.UTF_8)
+                            }
+                            stream.write(bytes)
+                            stream.flush()
+                        }
+                        snackbar.showSnackbar("Damaged ledger saved to external storage")
+                    } catch (e: Exception) {
+                        snackbar.showSnackbar("Failed to export damaged ledger: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    // Common Restore Backup Launcher
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.inspectBackupUri(uri) { res ->
+                if (res.isFailure) {
+                    val err = res.exceptionOrNull()?.message ?: "Unable to read backup"
+                    scope.launch { snackbar.showSnackbar("Invalid backup: $err") }
+                }
+            }
+        }
+    }
+
+    // Common Export Backup Launcher (.dueobak ZIP container)
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportBackupZip(uri) { res ->
+                if (res.isSuccess) {
+                    val manifest = res.getOrThrow()
+                    scope.launch {
+                        snackbar.showSnackbar(
+                            "Backup exported successfully (${manifest.peopleCount} people, ${manifest.entriesCount} transactions, ${manifest.photosCount} photos)"
+                        )
+                    }
+                } else {
+                    val err = res.exceptionOrNull()?.message ?: "Export failed"
+                    scope.launch { snackbar.showSnackbar("Failed to export backup: $err") }
+                }
+            }
+        }
+    }
+
     DueoTheme(dark) {
         Scaffold(
             modifier = Modifier.graphicsLayer { scaleX = backdropScale; scaleY = backdropScale },
@@ -119,8 +195,22 @@ fun DueoApp() {
                                             "Your original data was safely preserved at:\n${state.backupPath ?: "local backup"}.",
                                         style = MaterialTheme.typography.bodyMedium
                                     )
-                                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                        Button(onClick = { viewModel.retryLoad() }) { Text("Retry load") }
+                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(onClick = { viewModel.retryLoad() }, modifier = Modifier.fillMaxWidth()) {
+                                            Text("Retry load")
+                                        }
+                                        OutlinedButton(
+                                            onClick = { exportCorruptedLauncher.launch("dueo-damaged-${System.currentTimeMillis()}.json") },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Export damaged file")
+                                        }
+                                        OutlinedButton(
+                                            onClick = { importLauncher.launch(arrayOf("*/*")) },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Restore from backup")
+                                        }
                                     }
                                 }
                             }
@@ -162,20 +252,40 @@ fun DueoApp() {
                                     onAdd = add,
                                     onEditEntry = { editingEntry = it },
                                     onShareBalance = {
-                                        try {
-                                            val uri = StatementSharer.generateBalanceImage(context, selectedProfile, entries.filter { it.personId == selectedProfile.id }.balance())
-                                            StatementSharer.shareImage(context, uri, "Share balance", "Dueo balance statement with ${selectedProfile.name}")
-                                        } catch (e: Exception) {
-                                            scope.launch { snackbar.showSnackbar("Unable to generate balance image: ${e.message}") }
-                                        }
+                                        viewModel.shareBalance(
+                                            person = selectedProfile,
+                                            balance = entries.filter { it.personId == selectedProfile.id }.balance(),
+                                            onSuccess = { uri ->
+                                                StatementSharer.shareImage(context, uri, "Share balance", "Dueo balance statement with ${selectedProfile.name}")
+                                            },
+                                            onError = { e ->
+                                                scope.launch { snackbar.showSnackbar("Unable to generate balance image: ${e.message}") }
+                                            }
+                                        )
                                     },
-                                    onShareStatement = {
-                                        try {
-                                            val uri = StatementSharer.generateStatementImage(context, selectedProfile, entries.filter { it.personId == selectedProfile.id })
-                                            StatementSharer.shareImage(context, uri, "Share statement", "Dueo transaction statement for ${selectedProfile.name}")
-                                        } catch (e: Exception) {
-                                            scope.launch { snackbar.showSnackbar("Unable to generate statement image: ${e.message}") }
-                                        }
+                                    onShareStatementPdf = {
+                                        viewModel.shareStatementPdf(
+                                            person = selectedProfile,
+                                            entries = entries.filter { it.personId == selectedProfile.id },
+                                            onSuccess = { uri ->
+                                                StatementSharer.sharePdf(context, uri, "Share statement (PDF)", "Dueo transaction statement for ${selectedProfile.name}")
+                                            },
+                                            onError = { e ->
+                                                scope.launch { snackbar.showSnackbar("Unable to generate PDF statement: ${e.message}") }
+                                            }
+                                        )
+                                    },
+                                    onShareStatementImage = {
+                                        viewModel.shareStatementImage(
+                                            person = selectedProfile,
+                                            entries = entries.filter { it.personId == selectedProfile.id },
+                                            onSuccess = { uri ->
+                                                StatementSharer.shareImage(context, uri, "Share statement (Image)", "Dueo transaction statement for ${selectedProfile.name}")
+                                            },
+                                            onError = { e ->
+                                                scope.launch { snackbar.showSnackbar("Unable to generate statement image: ${e.message}") }
+                                            }
+                                        )
                                     }
                                 )
                             } else when (page) {
@@ -203,14 +313,15 @@ fun DueoApp() {
                                 else -> SettingsScreen(
                                     mode = mode,
                                     setTheme = { viewModel.setTheme(it); showTheme = false },
-                                    viewModel = viewModel,
-                                    snackbar = snackbar
+                                    onExportBackup = { exportBackupLauncher.launch("dueo-backup-${System.currentTimeMillis()}.dueobak") },
+                                    onRestoreBackup = { importLauncher.launch(arrayOf("*/*")) }
                                 )
                             }
                         }
                     }
                 }
 
+                // Toast notification when transaction saved
                 AnimatedVisibility(
                     savedToast,
                     enter = slideInVertically { -it } + fadeIn(),
@@ -224,7 +335,91 @@ fun DueoApp() {
                         }
                     }
                 }
+
+                // Loading overlay during background statement generation
+                if (viewModel.isGeneratingShare) {
+                    Dialog(onDismissRequest = {}) {
+                        Surface(
+                            shape = DueoDesign.CardShape,
+                            color = MaterialTheme.colorScheme.surface,
+                            shadowElevation = 12.dp
+                        ) {
+                            Row(
+                                Modifier.padding(24.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.5.dp)
+                                Text("Preparing statement…", style = MaterialTheme.typography.bodyLarge)
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // Restore Confirmation Dialog with Preview
+        viewModel.pendingRestorePreview?.let { preview ->
+            AlertDialog(
+                onDismissRequest = { if (!viewModel.isRestoringBackup) viewModel.dismissRestorePreview() },
+                title = { Text("Restore backup?") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Backup details:", style = MaterialTheme.typography.titleSmall)
+                        Text("• Format: ${if (preview.isZipArchive) "Portable archive (.dueobak)" else "Legacy JSON file"}")
+                        Text("• People: ${preview.peopleCount}")
+                        Text("• Transactions: ${preview.entriesCount}")
+                        if (preview.earliestDate != null && preview.latestDate != null) {
+                            val start = SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(preview.earliestDate))
+                            val end = SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(preview.latestDate))
+                            Text("• Activity dates: $start to $end")
+                        }
+                        Text("• Receivables: ${money(preview.totalReceive)}")
+                        Text("• Payables: ${money(preview.totalPay)}")
+                        if (preview.isZipArchive) {
+                            Text("• Profile photos: ${preview.photosCount} photos included")
+                        } else {
+                            Text("• Profile photos: None (legacy JSON)", color = MaterialTheme.colorScheme.error)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Surface(shape = DueoDesign.SmallShape, color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)) {
+                            Text(
+                                "Warning: Restoring this backup will replace current records. A recoverable safety snapshot of your existing data will be created automatically before replacement.",
+                                Modifier.padding(10.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            viewModel.confirmRestore(preview) { res ->
+                                if (res.isSuccess) {
+                                    val restored = res.getOrThrow()
+                                    scope.launch {
+                                        snackbar.showSnackbar("Restored ${restored.entries.size} transactions and ${restored.people.size} people successfully")
+                                    }
+                                } else {
+                                    val err = res.exceptionOrNull()?.message ?: "Restore failed"
+                                    scope.launch { snackbar.showSnackbar("Restore failed: $err") }
+                                }
+                            }
+                        },
+                        enabled = !viewModel.isRestoringBackup,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text(if (viewModel.isRestoringBackup) "Restoring…" else "Replace existing records")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { viewModel.dismissRestorePreview() },
+                        enabled = !viewModel.isRestoringBackup
+                    ) { Text("Cancel") }
+                }
+            )
         }
 
         // Add Person Dialog
@@ -313,12 +508,13 @@ fun DueoApp() {
                             saving = viewModel.isSavingTransaction,
                             people = readyLedger.people,
                             onAddPerson = { showAddPerson = true }
-                        ) { personId, amount, kind, note ->
+                        ) { personId, amount, kind, note, clientOpId ->
                             viewModel.addTransaction(
                                 personId = personId,
                                 amount = amount,
                                 kind = kind,
-                                note = note
+                                note = note,
+                                clientOperationId = clientOpId
                             ) { result ->
                                 if (result.isSuccess) {
                                     scope.launch {
@@ -344,59 +540,9 @@ fun DueoApp() {
 private fun SettingsScreen(
     mode: ThemeMode,
     setTheme: (ThemeMode) -> Unit,
-    viewModel: DueoViewModel,
-    snackbar: SnackbarHostState
+    onExportBackup: () -> Unit,
+    onRestoreBackup: () -> Unit
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/json")
-    ) { uri ->
-        if (uri != null) {
-            scope.launch {
-                val exportRes = viewModel.exportJson()
-                if (exportRes.isSuccess) {
-                    try {
-                        context.contentResolver.openOutputStream(uri)?.use { stream ->
-                            stream.write(exportRes.getOrThrow().toByteArray(Charsets.UTF_8))
-                        }
-                        snackbar.showSnackbar("Backup exported successfully")
-                    } catch (e: Exception) {
-                        snackbar.showSnackbar("Failed to write backup: ${e.message}")
-                    }
-                } else {
-                    snackbar.showSnackbar("Failed to prepare backup")
-                }
-            }
-        }
-    }
-
-    val importLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            scope.launch {
-                try {
-                    val raw = context.contentResolver.openInputStream(uri)?.use { stream ->
-                        stream.bufferedReader().readText()
-                    }
-                    if (raw != null) {
-                        viewModel.restoreFromJson(raw) { res ->
-                            if (res.isSuccess) {
-                                scope.launch { snackbar.showSnackbar("Restored ${res.getOrNull()} transactions successfully") }
-                            } else {
-                                scope.launch { snackbar.showSnackbar("Restore failed: ${res.exceptionOrNull()?.message}") }
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    snackbar.showSnackbar("Failed to read file: ${e.message}")
-                }
-            }
-        }
-    }
-
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Text("Settings", style = MaterialTheme.typography.headlineMedium) }
         item {
@@ -412,17 +558,17 @@ private fun SettingsScreen(
                 Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Backup & Restore", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Your financial records stay private on your device. Export a backup to save a copy or transfer records to another device.",
+                        "Your financial records stay private on your device. Export a portable backup container (.dueobak) including all profile photos and transaction ledgers to transfer records safely.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
-                            onClick = { exportLauncher.launch("dueo-backup-${System.currentTimeMillis()}.json") },
+                            onClick = onExportBackup,
                             modifier = Modifier.weight(1f)
                         ) { Text("Export backup") }
                         OutlinedButton(
-                            onClick = { importLauncher.launch(arrayOf("application/json", "*/*")) },
+                            onClick = onRestoreBackup,
                             modifier = Modifier.weight(1f)
                         ) { Text("Restore backup") }
                     }
@@ -458,11 +604,17 @@ private fun ThemeChoices(mode: ThemeMode, onSelect: (ThemeMode) -> Unit) {
 @Composable
 private fun PeopleScreen(entries: List<Entry>, registry: List<Person>, onPerson: (String) -> Unit, onAdd: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
-    val people = entries.people(registry).filter { it.name.contains(query, ignoreCase = true) || it.phone.contains(query) }
+    val people = remember(entries, registry, query) {
+        val queryTrimmed = query.trim()
+        val summaries = entries.people(registry)
+        summaries
+            .filter { queryTrimmed.isEmpty() || it.name.contains(queryTrimmed, ignoreCase = true) || it.phone.contains(queryTrimmed) }
+            .sortedBy { it.name.lowercase() }
+    }
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Your people", Modifier.weight(1f), style = MaterialTheme.typography.headlineMedium)
+                Text("People", Modifier.weight(1f), style = MaterialTheme.typography.headlineMedium)
                 IconButton(onClick = onAdd) { LineIcon(Glyph.ADD, "Add person") }
             }
         }
@@ -519,8 +671,45 @@ private fun PersonDetail(
     onAdd: (EntryKind?) -> Unit,
     onEditEntry: (Entry) -> Unit,
     onShareBalance: () -> Unit,
-    onShareStatement: () -> Unit
+    onShareStatementPdf: () -> Unit,
+    onShareStatementImage: () -> Unit
 ) {
+    var showStatementFormatDialog by remember { mutableStateOf(false) }
+
+    if (showStatementFormatDialog) {
+        AlertDialog(
+            onDismissRequest = { showStatementFormatDialog = false },
+            title = { Text("Share Statement") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Select statement format:")
+                    OutlinedButton(
+                        onClick = {
+                            showStatementFormatDialog = false
+                            onShareStatementPdf()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("PDF Document (Complete multi-page record)")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            showStatementFormatDialog = false
+                            onShareStatementImage()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Image Card (Graphic receipt)")
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showStatementFormatDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -541,7 +730,7 @@ private fun PersonDetail(
                 OutlinedButton(onClick = onShareBalance, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                     Text("Share balance")
                 }
-                OutlinedButton(onClick = onShareStatement, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                OutlinedButton(onClick = { showStatementFormatDialog = true }, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
                     Text("Share statement")
                 }
             }

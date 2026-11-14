@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -19,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import com.example.dueo.data.*
 import com.example.dueo.ui.theme.DueoDesign
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -66,10 +68,37 @@ internal fun EditTransactionDialog(
     onDelete: (Entry) -> Unit,
     onSave: (Entry) -> Unit
 ) {
+    val context = LocalContext.current
     var amountText by rememberSaveable { mutableStateOf(String.format(Locale.US, "%.2f", entry.amount / 100.0)) }
     var noteText by rememberSaveable { mutableStateOf(entry.note) }
+    var selectedDate by rememberSaveable { mutableLongStateOf(entry.date) }
+    var selectedDueDate by rememberSaveable { mutableStateOf<Long?>(entry.dueDate) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var localError by remember { mutableStateOf<String?>(null) }
+
+    val dateFormatter = remember { SimpleDateFormat("dd MMM yyyy", Locale.getDefault()) }
+
+    val showDatePicker = { initialDate: Long, onPicked: (Long) -> Unit ->
+        val cal = Calendar.getInstance().apply { timeInMillis = initialDate }
+        android.app.DatePickerDialog(
+            context,
+            { _, year, month, dayOfMonth ->
+                val picked = Calendar.getInstance().apply {
+                    set(Calendar.YEAR, year)
+                    set(Calendar.MONTH, month)
+                    set(Calendar.DAY_OF_MONTH, dayOfMonth)
+                    set(Calendar.HOUR_OF_DAY, 12)
+                    set(Calendar.MINUTE, 0)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                onPicked(picked.timeInMillis)
+            },
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH),
+            cal.get(Calendar.DAY_OF_MONTH)
+        ).show()
+    }
 
     if (showDeleteConfirm) {
         AlertDialog(
@@ -99,7 +128,7 @@ internal fun EditTransactionDialog(
                 Text("${entry.kind.label} with ${entry.person}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 OutlinedTextField(
                     value = amountText,
-                    onValueChange = { amountText = it },
+                    onValueChange = { amountText = it; localError = null },
                     label = { Text("Amount (₹)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     singleLine = true,
@@ -109,7 +138,7 @@ internal fun EditTransactionDialog(
                 )
                 OutlinedTextField(
                     value = noteText,
-                    onValueChange = { noteText = it.take(240) },
+                    onValueChange = { noteText = it.take(240); localError = null },
                     label = { Text("Note (optional)") },
                     singleLine = false,
                     maxLines = 3,
@@ -117,6 +146,54 @@ internal fun EditTransactionDialog(
                     shape = DueoDesign.SmallShape,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                // Date Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Transaction date", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(dateFormatter.format(Date(selectedDate)), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                    }
+                    TextButton(
+                        onClick = { showDatePicker(selectedDate) { selectedDate = it; localError = null } },
+                        enabled = !saving
+                    ) { Text("Change") }
+                }
+
+                // Due Date Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Due date", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            if (selectedDueDate != null) dateFormatter.format(Date(selectedDueDate!!)) else "None set",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (selectedDueDate != null) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                    }
+                    Row {
+                        if (selectedDueDate != null) {
+                            TextButton(
+                                onClick = { selectedDueDate = null; localError = null },
+                                enabled = !saving
+                            ) { Text("Clear") }
+                        }
+                        TextButton(
+                            onClick = {
+                                val init = selectedDueDate ?: (selectedDate + 7 * 86400000L)
+                                showDatePicker(init) { selectedDueDate = it; localError = null }
+                            },
+                            enabled = !saving
+                        ) { Text(if (selectedDueDate != null) "Change" else "Set due date") }
+                    }
+                }
+
                 if (localError != null) {
                     Text(localError.orEmpty(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
@@ -132,7 +209,9 @@ internal fun EditTransactionDialog(
                     }
                     val updated = entry.copy(
                         amount = parsed,
-                        note = noteText.trim()
+                        note = noteText.trim(),
+                        date = selectedDate,
+                        dueDate = selectedDueDate
                     )
                     onSave(updated)
                 },

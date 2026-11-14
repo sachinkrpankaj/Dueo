@@ -31,13 +31,22 @@ import com.example.dueo.ui.theme.DueoDesign
 
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
-internal fun EntryForm(entries: List<Entry>, initialKind: EntryKind, initialPerson: String = "", saving: Boolean, people: List<Person>, onAddPerson: () -> Unit, onSave: (String, Long, EntryKind, String) -> Unit) {
+internal fun EntryForm(
+    entries: List<Entry>,
+    initialKind: EntryKind,
+    initialPerson: String = "",
+    saving: Boolean,
+    people: List<Person>,
+    onAddPerson: () -> Unit,
+    onSave: (String, Long, EntryKind, String, String) -> Unit
+) {
     var selectedId by rememberSaveable { mutableStateOf(initialPerson) }
     var query by rememberSaveable { mutableStateOf("") }
     var amount by rememberSaveable { mutableStateOf("") }
     var note by rememberSaveable { mutableStateOf("") }
     var step by rememberSaveable { mutableIntStateOf(if (initialPerson.isBlank()) 0 else 1) }
     var attempted by rememberSaveable { mutableStateOf(false) }
+    val operationId = rememberSaveable { java.util.UUID.randomUUID().toString() }
     val focus = LocalFocusManager.current
     LaunchedEffect(initialPerson) { if (initialPerson.isNotBlank()) { selectedId = initialPerson; step = 1 } }
     val selected = people.firstOrNull { it.id == selectedId }
@@ -146,7 +155,7 @@ internal fun EntryForm(entries: List<Entry>, initialKind: EntryKind, initialPers
                     }
                     item { OutlinedTextField(note, { note = it.take(240) }, modifier = Modifier.fillMaxWidth(), label = { Text("Note (optional)") }, enabled = !saving, maxLines = 3, shape = DueoDesign.SmallShape) }
                     item {
-                        Button(onClick = { if (!saving && error == null && parsed != null) onSave(selectedId, parsed, initialKind, note.trim()) },
+                        Button(onClick = { if (!saving && error == null && parsed != null) onSave(selectedId, parsed, initialKind, note.trim(), operationId) },
                             enabled = !saving && error == null, modifier = Modifier.fillMaxWidth().height(54.dp)) {
                             AnimatedContent(saving, label = "save state") { busy ->
                                 if (busy) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
