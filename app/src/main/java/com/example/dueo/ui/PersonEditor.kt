@@ -28,6 +28,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.dueo.data.cleanupCropFile
 import com.example.dueo.ui.theme.DueoDesign
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,6 +44,14 @@ fun PersonEditor(saving: Boolean, error: String? = null, onDismiss: () -> Unit, 
     var photo by rememberSaveable { mutableStateOf<String?>(null) }
     var importError by remember { mutableStateOf<String?>(null) }
     var importing by remember { mutableStateOf(false) }
+
+    val dismissAndCleanup: () -> Unit = {
+        if (!saving && !importing) {
+            cleanupCropFile(photo)
+            onDismiss()
+        }
+    }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) cropUri = uri.toString()
     }
@@ -66,14 +75,22 @@ fun PersonEditor(saving: Boolean, error: String? = null, onDismiss: () -> Unit, 
             }
         }
     }
-    Dialog(onDismissRequest = { if (!saving && !importing) onDismiss() }, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    Dialog(onDismissRequest = dismissAndCleanup, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             BackHandler(cropUri != null) { cropUri = null }
             AnimatedContent(cropUri, transitionSpec = { pageMotion(targetState != null) }, label = "profile crop") { uri ->
-                if (uri != null) SquarePhotoCropper(Uri.parse(uri), onCancel = { cropUri = null }, onCropped = { photo = it; cropUri = null })
+                if (uri != null) SquarePhotoCropper(
+                    Uri.parse(uri),
+                    onCancel = { cropUri = null },
+                    onCropped = { newCrop ->
+                        cleanupCropFile(photo)
+                        photo = newCrop
+                        cropUri = null
+                    }
+                )
                 else Column(Modifier.fillMaxSize().systemBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onDismiss, enabled = !saving && !importing) { LineIcon(Glyph.BACK, "Cancel adding person") }
+                        IconButton(onClick = dismissAndCleanup, enabled = !saving && !importing) { LineIcon(Glyph.BACK, "Cancel adding person") }
                         Text("Add person", style = MaterialTheme.typography.headlineMedium)
                     }
                     Text("Create their profile first. Record money with them whenever you need.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -83,7 +100,10 @@ fun PersonEditor(saving: Boolean, error: String? = null, onDismiss: () -> Unit, 
                             runCatching { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
                                 .onFailure { importError = "No photo picker is available on this device." }
                         }, enabled = !saving && !importing) { Text(if (photo == null) "Choose photo" else "Change photo") }
-                        if (photo != null) TextButton(onClick = { photo = null }, enabled = !saving) { Text("Remove photo") }
+                        if (photo != null) TextButton(onClick = {
+                            cleanupCropFile(photo)
+                            photo = null
+                        }, enabled = !saving) { Text("Remove photo") }
                         Text("Optional · cropped to a square", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     OutlinedButton(onClick = {

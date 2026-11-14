@@ -1,0 +1,252 @@
+package com.example.dueo.data
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.*
+import android.net.Uri
+import androidx.core.content.FileProvider
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
+import kotlin.math.min
+
+object StatementSharer {
+
+    private fun getSharedDir(context: Context): File {
+        val dir = File(context.cacheDir, "shared")
+        if (!dir.exists()) dir.mkdirs()
+        return dir
+    }
+
+    /**
+     * Generates a high-quality, branded square image representing the current balance with a person.
+     */
+    fun generateBalanceImage(context: Context, person: Person, balance: Balance): Uri {
+        val width = 1080
+        val height = 1080
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+
+        // Gradient background (Dueo Brand Violet/Indigo)
+        val gradient = LinearGradient(
+            0f, 0f, 0f, height.toFloat(),
+            intArrayOf(0xFF7160F3.toInt(), 0xFF5642CC.toInt(), 0xFF2A1B80.toInt()),
+            null, Shader.TileMode.CLAMP
+        )
+        val bgPaint = Paint().apply { shader = gradient }
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+
+        // Inner Card
+        val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFFFFFFF.toInt()
+            setShadowLayer(30f, 0f, 15f, 0x33000000)
+        }
+        val cardRect = RectF(70f, 70f, width - 70f, height - 70f)
+        canvas.drawRoundRect(cardRect, 48f, 48f, cardPaint)
+
+        // Text Paints
+        val brandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF5642CC.toInt()
+            textSize = 54f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val taglinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF727187.toInt()
+            textSize = 28f
+        }
+        val personPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF171523.toInt()
+            textSize = 62f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val sectionTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF727187.toInt()
+            textSize = 32f
+        }
+        val receiveAmountPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF4F378B.toInt()
+            textSize = 58f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val payAmountPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFB3261E.toInt()
+            textSize = 58f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val netDuesPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF171523.toInt()
+            textSize = 72f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val datePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF888899.toInt()
+            textSize = 26f
+        }
+        val disclaimerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFA0A0B0.toInt()
+            textSize = 24f
+            textAlign = Paint.Align.CENTER
+        }
+
+        // Draw Header
+        canvas.drawText("dueo", 130f, 160f, brandPaint)
+        canvas.drawText("Shared dues, made simple.", 130f, 205f, taglinePaint)
+
+        // Divider
+        val dividerPaint = Paint().apply {
+            color = 0xFFE8E8EE.toInt()
+            strokeWidth = 2f
+        }
+        canvas.drawLine(130f, 245f, width - 130f, 245f, dividerPaint)
+
+        // Person Name
+        canvas.drawText("Statement for", 130f, 310f, sectionTitlePaint)
+        canvas.drawText(person.name, 130f, 380f, personPaint)
+
+        // Amounts Section
+        val colWidth = (width - 260f) / 2f
+        canvas.drawText("They owe you", 130f, 470f, sectionTitlePaint)
+        canvas.drawText(money(balance.receive), 130f, 540f, receiveAmountPaint)
+
+        canvas.drawText("You owe them", 130f + colWidth, 470f, sectionTitlePaint)
+        canvas.drawText(money(balance.pay), 130f + colWidth, 540f, payAmountPaint)
+
+        // Net dues box
+        val netBoxRect = RectF(130f, 610f, width - 130f, 790f)
+        val netBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFF4F3FA.toInt()
+        }
+        canvas.drawRoundRect(netBoxRect, 28f, 28f, netBoxPaint)
+
+        val net = balance.receive - balance.pay
+        canvas.drawText("Net Balance", 170f, 675f, sectionTitlePaint)
+        canvas.drawText(money(net), 170f, 755f, netDuesPaint)
+
+        // Date and Disclaimer
+        val dateFormat = SimpleDateFormat("dd MMMM yyyy, hh:mm a", Locale.getDefault())
+        canvas.drawText("Generated: ${dateFormat.format(Date())}", 130f, 855f, datePaint)
+        canvas.drawText("Personal record generated by Dueo. Please verify all entries.", (width / 2).toFloat(), 940f, disclaimerPaint)
+
+        // Save Bitmap
+        val file = File(getSharedDir(context), "dueo-balance-${UUID.randomUUID()}.png")
+        FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    }
+
+    /**
+     * Generates a detailed statement image containing chronological transactions and balances.
+     */
+    fun generateStatementImage(context: Context, person: Person, entries: List<Entry>): Uri {
+        val chronological = entries.sortedBy { it.date }
+        val width = 1080
+        val rowHeight = 90
+        val baseHeight = 560
+        val totalHeight = (baseHeight + (chronological.size.coerceAtMost(30) * rowHeight)).coerceIn(900, 3200)
+
+        val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+
+        // Background
+        canvas.drawColor(0xFFF7F8FC.toInt())
+
+        // Header Card
+        val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5642CC.toInt() }
+        canvas.drawRect(0f, 0f, width.toFloat(), 240f, headerPaint)
+
+        val whiteBrandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 52f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        val whiteSubPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFDDD6FE.toInt()
+            textSize = 28f
+        }
+        canvas.drawText("dueo", 60f, 90f, whiteBrandPaint)
+        canvas.drawText("Statement of Account · ${person.name}", 60f, 145f, whiteSubPaint)
+        val dateFormat = SimpleDateFormat("dd MMM yyyy", Locale.getDefault())
+        canvas.drawText("Generated on ${dateFormat.format(Date())}", 60f, 195f, whiteSubPaint)
+
+        // Table Header
+        var y = 290f
+        val tableHeadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF727187.toInt()
+            textSize = 26f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+        canvas.drawText("DATE", 60f, y, tableHeadPaint)
+        canvas.drawText("DESCRIPTION / NOTE", 230f, y, tableHeadPaint)
+        canvas.drawText("TYPE", 660f, y, tableHeadPaint)
+        val amountHeadPaint = Paint(tableHeadPaint).apply { textAlign = Paint.Align.RIGHT }
+        canvas.drawText("AMOUNT", width - 60f, y, amountHeadPaint)
+
+        val dividerPaint = Paint().apply { color = 0xFFE2E4EE.toInt(); strokeWidth = 2f }
+        canvas.drawLine(60f, y + 15f, width - 60f, y + 15f, dividerPaint)
+        y += 55f
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF202039.toInt(); textSize = 28f }
+        val notePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF555566.toInt(); textSize = 26f }
+        val rightTextPaint = Paint(textPaint).apply {
+            textAlign = Paint.Align.RIGHT
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        }
+
+        val displayedEntries = chronological.take(30)
+        for (e in displayedEntries) {
+            val dateStr = dateFormat.format(Date(e.date))
+            canvas.drawText(dateStr, 60f, y, textPaint)
+
+            val noteStr = (if (e.note.isNotBlank()) e.note else e.kind.label).take(24)
+            canvas.drawText(noteStr, 230f, y, notePaint)
+            canvas.drawText(e.kind.name, 660f, y, textPaint)
+            canvas.drawText(money(e.amount), width - 60f, y, rightTextPaint)
+
+            y += 30f
+            canvas.drawLine(60f, y, width - 60f, y, dividerPaint)
+            y += 55f
+        }
+
+        if (chronological.size > 30) {
+            val extraCount = chronological.size - 30
+            canvas.drawText("... and $extraCount more earlier transactions", 60f, y, notePaint)
+            y += 60f
+        }
+
+        // Summary box
+        val balance = entries.balance()
+        val sumBox = RectF(60f, y, width - 60f, y + 130f)
+        val sumBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        canvas.drawRoundRect(sumBox, 20f, 20f, sumBoxPaint)
+
+        canvas.drawText("Outstanding Balance:", 90f, y + 55f, tableHeadPaint)
+        val balStr = "They owe: ${money(balance.receive)}   |   You owe: ${money(balance.pay)}"
+        canvas.drawText(balStr, 90f, y + 100f, textPaint)
+
+        val file = File(getSharedDir(context), "dueo-statement-${UUID.randomUUID()}.png")
+        FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    }
+
+    /**
+     * Shares a content URI using the Android system Sharesheet.
+     */
+    fun shareImage(context: Context, uri: Uri, title: String, textMessage: String) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "image/png"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_TEXT, textMessage)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = Intent.createChooser(intent, title).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(chooser)
+    }
+}

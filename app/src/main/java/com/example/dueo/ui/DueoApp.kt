@@ -1,13 +1,15 @@
 package com.example.dueo.ui
 
+import android.app.Application
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
-import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -18,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
@@ -25,85 +28,195 @@ import com.example.dueo.R
 import com.example.dueo.data.*
 import com.example.dueo.ui.theme.*
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DueoApp() {
     val activity = LocalContext.current as? ComponentActivity
-    val context = LocalContext.current.applicationContext
-    val preferences = remember { ThemePreferences(context) }
-    val themeFlow = remember { preferences.mode.catch { emit(ThemeMode.SYSTEM) } }
-    val mode by themeFlow.collectAsState(initial = ThemeMode.SYSTEM)
-    val dark = mode == ThemeMode.DARK || (mode == ThemeMode.SYSTEM && isSystemInDarkTheme())
-    val store = remember { LedgerStore(context) }
+    val context = LocalContext.current.applicationContext as Application
+    val viewModel = remember { DueoViewModel(context) }
     val scope = rememberCoroutineScope()
-    var ledger by remember { mutableStateOf(LedgerState()) }
-    val entries = ledger.entries
-    val people = ledger.people
+    val snackbar = remember { SnackbarHostState() }
+
+    val mode by viewModel.themeMode.collectAsState()
+    val dark = mode == ThemeMode.DARK || (mode == ThemeMode.SYSTEM && isSystemInDarkTheme())
+
+    val uiState by viewModel.uiState.collectAsState()
+
     var showAddPerson by rememberSaveable { mutableStateOf(false) }
-    var personSaving by remember { mutableStateOf(false) }
-    var personError by remember { mutableStateOf<String?>(null) }
-    var loaded by remember { mutableStateOf(false) }
-    var loadError by remember { mutableStateOf(false) }
-    var saving by remember { mutableStateOf(false) }
-    var saved by remember { mutableStateOf(false) }
-    LaunchedEffect(saved) { if (saved) { delay(2200); saved = false } }
+    var savedToast by remember { mutableStateOf(false) }
+    LaunchedEffect(savedToast) {
+        if (savedToast) {
+            delay(2200)
+            savedToast = false
+        }
+    }
+
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var showEntry by rememberSaveable { mutableStateOf(false) }
     var showTypes by rememberSaveable { mutableStateOf(false) }
     var showTheme by rememberSaveable { mutableStateOf(false) }
-    var person by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedPersonId by rememberSaveable { mutableStateOf<String?>(null) }
     var initialPerson by rememberSaveable { mutableStateOf("") }
     var initialKind by rememberSaveable { mutableStateOf(EntryKind.LENT) }
+
+    var editingEntry by remember { mutableStateOf<Entry?>(null) }
+
     SideEffect {
         activity?.enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark || (tab == 0 && person == null) },
+            statusBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark },
             navigationBarStyle = SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark }
         )
     }
-    val snackbar = remember { SnackbarHostState() }
+
     val transactionSheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val backdropScale by animateFloatAsState(if (showTypes || showEntry) .965f else 1f, tween(420, easing = DueoMotion.Ease), label = "sheet depth")
+    val backdropScale by animateFloatAsState(
+        if (showTypes || showEntry) .965f else 1f,
+        tween(420, easing = DueoMotion.Ease),
+        label = "sheet depth"
+    )
+
     val add: (EntryKind?) -> Unit = { kind ->
-        initialPerson = person.orEmpty()
+        initialPerson = selectedPersonId.orEmpty()
         if (kind == null) showTypes = true else { initialKind = kind; showEntry = true }
     }
-    val setTheme: (ThemeMode) -> Unit = { selected ->
-        scope.launch {
-            try { preferences.set(selected); showTheme = false }
-            catch (_: Exception) { snackbar.showSnackbar("Couldn't save theme. Please try again.") }
-        }
-    }
-    LaunchedEffect(Unit) {
-        try { ledger = withContext(Dispatchers.IO) { store.readState() }; loaded = true }
-        catch (_: Exception) { loadError = true }
-    }
-    BackHandler(person != null) { person = null }
+
+    BackHandler(selectedPersonId != null) { selectedPersonId = null }
+
     DueoTheme(dark) {
         Scaffold(
             modifier = Modifier.graphicsLayer { scaleX = backdropScale; scaleY = backdropScale },
-            containerColor = if (tab == 0 && person == null) androidx.compose.ui.graphics.Color(0xFF111318) else MaterialTheme.colorScheme.background,
+            containerColor = MaterialTheme.colorScheme.background,
             snackbarHost = { SnackbarHost(snackbar) },
-            bottomBar = { Surface(color = MaterialTheme.colorScheme.background) { PillNavigation(tab) { tab = it; person = null } } }
-        ) { padding ->
-            Box(Modifier.fillMaxSize().padding(padding)) {
-                if (!loaded) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    if (loadError) Text("Your records couldn't be opened.\nRestart to retry. Your data is preserved.", Modifier.padding(24.dp)) else CircularProgressIndicator()
-                } else AnimatedContent(targetState = person to tab, transitionSpec = { pageMotion(targetState.first != null || (initialState.first == null && targetState.second > initialState.second)) }, label = "screen") { (selectedPerson, page) ->
-                    val selectedProfile = people.firstOrNull { it.id == selectedPerson }
-                    if (selectedProfile != null) PersonDetail(selectedProfile, entries.filter { it.personId == selectedProfile.id }, { person = null }, add)
-                    else when (page) {
-                        0 -> HomeScreen(entries, dark, { showTheme = true }, add, { tab = 1 }, { person = it }, people, { showAddPerson = true })
-                        1 -> PeopleScreen(entries, people, { person = it }, { showAddPerson = true })
-                        2 -> ActivityScreen(entries, { add(null) })
-                        else -> SettingsScreen(mode, setTheme)
+            bottomBar = {
+                Surface(color = MaterialTheme.colorScheme.background) {
+                    PillNavigation(tab) {
+                        tab = it
+                        selectedPersonId = null
                     }
                 }
-                AnimatedVisibility(saved, enter = slideInVertically { -it } + fadeIn(), exit = slideOutVertically { -it } + fadeOut(), modifier = Modifier.align(Alignment.TopCenter).padding(16.dp)) {
+            }
+        ) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding)) {
+                when (val state = uiState) {
+                    is LedgerUiState.Loading -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                    is LedgerUiState.Corrupted -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Card(
+                                modifier = Modifier.padding(24.dp).fillMaxWidth(),
+                                shape = DueoDesign.CardShape,
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                            ) {
+                                Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                    Text("Ledger recovery required", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.error)
+                                    Text(
+                                        "An issue was detected while opening your ledger: ${state.message}.\n\n" +
+                                            "Your original data was safely preserved at:\n${state.backupPath ?: "local backup"}.",
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Button(onClick = { viewModel.retryLoad() }) { Text("Retry load") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    is LedgerUiState.Unsupported -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                "Unsupported ledger version ${state.version}.\nPlease update Dueo to open this file.",
+                                Modifier.padding(24.dp),
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                        }
+                    }
+                    is LedgerUiState.Error -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text(state.message, color = MaterialTheme.colorScheme.error)
+                                Button(onClick = { viewModel.retryLoad() }) { Text("Retry") }
+                            }
+                        }
+                    }
+                    is LedgerUiState.Ready -> {
+                        val ledger = state.ledger
+                        val people = ledger.people
+                        val entries = ledger.entries
+
+                        AnimatedContent(
+                            targetState = selectedPersonId to tab,
+                            transitionSpec = { pageMotion(targetState.first != null || (initialState.first == null && targetState.second > initialState.second)) },
+                            label = "screen"
+                        ) { (currentPersonId, page) ->
+                            val selectedProfile = people.firstOrNull { it.id == currentPersonId }
+                            if (selectedProfile != null) {
+                                PersonDetail(
+                                    person = selectedProfile,
+                                    entries = entries.filter { it.personId == selectedProfile.id },
+                                    onBack = { selectedPersonId = null },
+                                    onAdd = add,
+                                    onEditEntry = { editingEntry = it },
+                                    onShareBalance = {
+                                        try {
+                                            val uri = StatementSharer.generateBalanceImage(context, selectedProfile, entries.filter { it.personId == selectedProfile.id }.balance())
+                                            StatementSharer.shareImage(context, uri, "Share balance", "Dueo balance statement with ${selectedProfile.name}")
+                                        } catch (e: Exception) {
+                                            scope.launch { snackbar.showSnackbar("Unable to generate balance image: ${e.message}") }
+                                        }
+                                    },
+                                    onShareStatement = {
+                                        try {
+                                            val uri = StatementSharer.generateStatementImage(context, selectedProfile, entries.filter { it.personId == selectedProfile.id })
+                                            StatementSharer.shareImage(context, uri, "Share statement", "Dueo transaction statement for ${selectedProfile.name}")
+                                        } catch (e: Exception) {
+                                            scope.launch { snackbar.showSnackbar("Unable to generate statement image: ${e.message}") }
+                                        }
+                                    }
+                                )
+                            } else when (page) {
+                                0 -> HomeScreen(
+                                    entries = entries,
+                                    dark = dark,
+                                    onTheme = { showTheme = true },
+                                    onAdd = add,
+                                    onPeople = { tab = 1 },
+                                    onPerson = { selectedPersonId = it },
+                                    registry = people,
+                                    onAddPerson = { showAddPerson = true }
+                                )
+                                1 -> PeopleScreen(
+                                    entries = entries,
+                                    registry = people,
+                                    onPerson = { selectedPersonId = it },
+                                    onAdd = { showAddPerson = true }
+                                )
+                                2 -> ActivityScreen(
+                                    entries = entries,
+                                    onAdd = { add(null) },
+                                    onEditEntry = { editingEntry = it }
+                                )
+                                else -> SettingsScreen(
+                                    mode = mode,
+                                    setTheme = { viewModel.setTheme(it); showTheme = false },
+                                    viewModel = viewModel,
+                                    snackbar = snackbar
+                                )
+                            }
+                        }
+                    }
+                }
+
+                AnimatedVisibility(
+                    savedToast,
+                    enter = slideInVertically { -it } + fadeIn(),
+                    exit = slideOutVertically { -it } + fadeOut(),
+                    modifier = Modifier.align(Alignment.TopCenter).padding(16.dp)
+                ) {
                     Surface(shape = DueoDesign.CardShape, color = MaterialTheme.colorScheme.primaryContainer, shadowElevation = 8.dp) {
                         Row(Modifier.padding(horizontal = 24.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             SuccessTick()
@@ -113,59 +226,114 @@ fun DueoApp() {
                 }
             }
         }
-        if (showAddPerson) PersonEditor(saving = personSaving, error = personError, onDismiss = { if (!personSaving) showAddPerson = false }) { name, phone, photo ->
-            if (!personSaving) {
-                personSaving = true
-                personError = null
-                scope.launch {
-                    try {
-                        val updated = withContext(Dispatchers.IO) { store.addPerson(ledger, name, phone, photo) }
-                        ledger = updated
-                        if (showEntry) initialPerson = updated.people.last().id
-                        showAddPerson = false
-                    } catch (_: Exception) { personError = "Couldn't save person. Please try again." }
-                    finally { personSaving = false }
+
+        // Add Person Dialog
+        if (showAddPerson) {
+            PersonEditor(
+                saving = viewModel.isSavingPerson,
+                error = viewModel.personError,
+                onDismiss = { if (!viewModel.isSavingPerson) showAddPerson = false }
+            ) { name, phone, photo ->
+                viewModel.addPerson(name, phone, photo) { created ->
+                    if (showEntry) initialPerson = created.id
+                    showAddPerson = false
                 }
             }
         }
-        if (showTheme) AlertDialog(onDismissRequest = { showTheme = false }, title = { Text("Appearance") }, text = {
-            ThemeChoices(mode, setTheme)
-        }, confirmButton = { TextButton(onClick = { showTheme = false }) { Text("Done") } })
-        if (showTypes || showEntry) ModalBottomSheet(
-            onDismissRequest = { if (!saving) { showTypes = false; showEntry = false } },
-            sheetState = transactionSheet, containerColor = MaterialTheme.colorScheme.surface
-        ) {
-            AnimatedContent(showTypes, transitionSpec = { sheetMotion(!targetState) }, label = "transaction sheet stage") { choosingType ->
-                if (choosingType) {
-            Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Add a transaction", style = MaterialTheme.typography.headlineMedium)
-                Text("Choose what happened", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                EntryKind.entries.forEach { kind ->
-                    OutlinedButton(onClick = { initialKind = kind; showTypes = false; showEntry = true }, modifier = Modifier.enterMotion(kind.ordinal).fillMaxWidth().heightIn(min = 52.dp)) { Text(kind.label) }
-                }
-            }
-                } else {
-            EntryForm(entries, initialKind, initialPerson, saving, people, { showAddPerson = true }) { personId, amount, kind, note ->
-                if (!saving) {
-                    saving = true
-                    scope.launch {
-                        val selected = people.first { it.id == personId }
-                        val updated = ledger.copy(entries = entries + Entry(person = selected.name, personId = selected.id, amount = amount, kind = kind, note = note))
-                        try {
-                            withContext(Dispatchers.IO) { store.writeState(updated) }
-                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            saving = false
-                            snackbar.showSnackbar("Couldn't save. Please try again.")
-                            return@launch
+
+        // Theme Dialog
+        if (showTheme) {
+            AlertDialog(
+                onDismissRequest = { showTheme = false },
+                title = { Text("Appearance") },
+                text = {
+                    ThemeChoices(mode) {
+                        viewModel.setTheme(it)
+                        showTheme = false
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showTheme = false }) { Text("Done") } }
+            )
+        }
+
+        // Edit Transaction Dialog
+        editingEntry?.let { entry ->
+            EditTransactionDialog(
+                entry = entry,
+                saving = viewModel.isSavingTransaction,
+                onDismiss = { editingEntry = null },
+                onDelete = {
+                    viewModel.deleteTransaction(entry.id) { res ->
+                        if (res.isSuccess) {
+                            editingEntry = null
+                            scope.launch { snackbar.showSnackbar("Transaction deleted") }
+                        } else {
+                            scope.launch { snackbar.showSnackbar(res.exceptionOrNull()?.message ?: "Delete failed") }
                         }
-                        ledger = updated
-                        try { transactionSheet.hide() }
-                        finally { showEntry = false; saving = false; saved = true }
+                    }
+                },
+                onSave = { updated ->
+                    viewModel.updateTransaction(updated) { res ->
+                        if (res.isSuccess) {
+                            editingEntry = null
+                            scope.launch { snackbar.showSnackbar("Transaction updated") }
+                        } else {
+                            scope.launch { snackbar.showSnackbar(res.exceptionOrNull()?.message ?: "Update failed") }
+                        }
                     }
                 }
-            }
+            )
+        }
+
+        // Add Transaction Bottom Sheet
+        if (showTypes || showEntry) {
+            val readyLedger = (uiState as? LedgerUiState.Ready)?.ledger ?: LedgerState()
+            ModalBottomSheet(
+                onDismissRequest = { if (!viewModel.isSavingTransaction) { showTypes = false; showEntry = false } },
+                sheetState = transactionSheet,
+                containerColor = MaterialTheme.colorScheme.surface
+            ) {
+                AnimatedContent(showTypes, transitionSpec = { sheetMotion(!targetState) }, label = "transaction sheet stage") { choosingType ->
+                    if (choosingType) {
+                        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("Add a transaction", style = MaterialTheme.typography.headlineMedium)
+                            Text("Choose what happened", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            EntryKind.entries.forEach { kind ->
+                                OutlinedButton(
+                                    onClick = { initialKind = kind; showTypes = false; showEntry = true },
+                                    modifier = Modifier.enterMotion(kind.ordinal).fillMaxWidth().heightIn(min = 52.dp)
+                                ) { Text(kind.label) }
+                            }
+                        }
+                    } else {
+                        EntryForm(
+                            entries = readyLedger.entries,
+                            initialKind = initialKind,
+                            initialPerson = initialPerson,
+                            saving = viewModel.isSavingTransaction,
+                            people = readyLedger.people,
+                            onAddPerson = { showAddPerson = true }
+                        ) { personId, amount, kind, note ->
+                            viewModel.addTransaction(
+                                personId = personId,
+                                amount = amount,
+                                kind = kind,
+                                note = note
+                            ) { result ->
+                                if (result.isSuccess) {
+                                    scope.launch {
+                                        try { transactionSheet.hide() } finally {
+                                            showEntry = false
+                                            savedToast = true
+                                        }
+                                    }
+                                } else {
+                                    val err = result.exceptionOrNull()?.message ?: "Couldn't save transaction"
+                                    scope.launch { snackbar.showSnackbar(err) }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -173,7 +341,62 @@ fun DueoApp() {
 }
 
 @Composable
-private fun SettingsScreen(mode: ThemeMode, setTheme: (ThemeMode) -> Unit) {
+private fun SettingsScreen(
+    mode: ThemeMode,
+    setTheme: (ThemeMode) -> Unit,
+    viewModel: DueoViewModel,
+    snackbar: SnackbarHostState
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val exportRes = viewModel.exportJson()
+                if (exportRes.isSuccess) {
+                    try {
+                        context.contentResolver.openOutputStream(uri)?.use { stream ->
+                            stream.write(exportRes.getOrThrow().toByteArray(Charsets.UTF_8))
+                        }
+                        snackbar.showSnackbar("Backup exported successfully")
+                    } catch (e: Exception) {
+                        snackbar.showSnackbar("Failed to write backup: ${e.message}")
+                    }
+                } else {
+                    snackbar.showSnackbar("Failed to prepare backup")
+                }
+            }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val raw = context.contentResolver.openInputStream(uri)?.use { stream ->
+                        stream.bufferedReader().readText()
+                    }
+                    if (raw != null) {
+                        viewModel.restoreFromJson(raw) { res ->
+                            if (res.isSuccess) {
+                                scope.launch { snackbar.showSnackbar("Restored ${res.getOrNull()} transactions successfully") }
+                            } else {
+                                scope.launch { snackbar.showSnackbar("Restore failed: ${res.exceptionOrNull()?.message}") }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    snackbar.showSnackbar("Failed to read file: ${e.message}")
+                }
+            }
+        }
+    }
+
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Text("Settings", style = MaterialTheme.typography.headlineMedium) }
         item {
@@ -181,6 +404,28 @@ private fun SettingsScreen(mode: ThemeMode, setTheme: (ThemeMode) -> Unit) {
                 Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Appearance", style = MaterialTheme.typography.titleLarge)
                     ThemeChoices(mode, setTheme)
+                }
+            }
+        }
+        item {
+            Surface(shape = DueoDesign.CardShape) {
+                Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Backup & Restore", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Your financial records stay private on your device. Export a backup to save a copy or transfer records to another device.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Button(
+                            onClick = { exportLauncher.launch("dueo-backup-${System.currentTimeMillis()}.json") },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Export backup") }
+                        OutlinedButton(
+                            onClick = { importLauncher.launch(arrayOf("application/json", "*/*")) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Restore backup") }
+                    }
                 }
             }
         }
@@ -221,14 +466,35 @@ private fun PeopleScreen(entries: List<Entry>, registry: List<Person>, onPerson:
                 IconButton(onClick = onAdd) { LineIcon(Glyph.ADD, "Add person") }
             }
         }
-        item { OutlinedTextField(query, { query = it }, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Search people") }, leadingIcon = { LineIcon(Glyph.SEARCH) }, singleLine = true, shape = DueoDesign.SmallShape) }
-        if (people.isEmpty()) item { Text(if (query.isBlank()) "Add your first person, then record money lent or borrowed." else "No matching people.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp)) }
-        items(people, key = { it.id }) { summary -> PersonRow(summary, Modifier.animateItem()) { onPerson(summary.id) } }
+        item {
+            OutlinedTextField(
+                query, { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Search people") },
+                leadingIcon = { LineIcon(Glyph.SEARCH) },
+                singleLine = true,
+                shape = DueoDesign.SmallShape
+            )
+        }
+        if (people.isEmpty()) item {
+            Text(
+                if (query.isBlank()) "Add your first person, then record money lent or borrowed." else "No matching people.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp)
+            )
+        }
+        items(people, key = { it.id }) { summary ->
+            PersonRow(summary, Modifier.animateItem()) { onPerson(summary.id) }
+        }
     }
 }
 
 @Composable
-private fun ActivityScreen(entries: List<Entry>, onAdd: () -> Unit) {
+private fun ActivityScreen(
+    entries: List<Entry>,
+    onAdd: () -> Unit,
+    onEditEntry: (Entry) -> Unit
+) {
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -237,12 +503,24 @@ private fun ActivityScreen(entries: List<Entry>, onAdd: () -> Unit) {
             }
         }
         if (entries.isEmpty()) item { Text("Your transactions will appear here.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        items(entries.sortedByDescending { it.date }, key = { it.id }) { Box(Modifier.animateItem().enterMotion()) { EntryRow(it) } }
+        items(entries.sortedByDescending { it.date }, key = { it.id }) { entry ->
+            Box(Modifier.animateItem().enterMotion()) {
+                EntryRow(entry, onEdit = onEditEntry)
+            }
+        }
     }
 }
 
 @Composable
-private fun PersonDetail(person: Person, entries: List<Entry>, onBack: () -> Unit, onAdd: (EntryKind?) -> Unit) {
+private fun PersonDetail(
+    person: Person,
+    entries: List<Entry>,
+    onBack: () -> Unit,
+    onAdd: (EntryKind?) -> Unit,
+    onEditEntry: (Entry) -> Unit,
+    onShareBalance: () -> Unit,
+    onShareStatement: () -> Unit
+) {
     LazyColumn(contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -253,8 +531,26 @@ private fun PersonDetail(person: Person, entries: List<Entry>, onBack: () -> Uni
         }
         item { if (person.phone.isNotBlank()) Text(person.phone, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         item { BalanceOverview(entries.balance()) }
-        item { Button(onClick = { onAdd(null) }, modifier = Modifier.fillMaxWidth()) { Text("Record transaction or repayment") } }
+        item {
+            Button(onClick = { onAdd(null) }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
+                Text("Record transaction or repayment")
+            }
+        }
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = onShareBalance, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                    Text("Share balance")
+                }
+                OutlinedButton(onClick = onShareStatement, modifier = Modifier.weight(1f).heightIn(min = 48.dp)) {
+                    Text("Share statement")
+                }
+            }
+        }
         item { Text("Transaction history", style = MaterialTheme.typography.titleLarge) }
-        items(entries.sortedByDescending { it.date }, key = { it.id }) { Box(Modifier.animateItem().enterMotion()) { EntryRow(it) } }
+        items(entries.sortedByDescending { it.date }, key = { it.id }) { entry ->
+            Box(Modifier.animateItem().enterMotion()) {
+                EntryRow(entry, onEdit = onEditEntry)
+            }
+        }
     }
 }

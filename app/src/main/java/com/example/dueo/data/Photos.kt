@@ -17,6 +17,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 data class SquareCrop(val left: Int, val top: Int, val side: Int)
+
 fun squareCrop(width: Int, height: Int, zoom: Float, centerX: Float, centerY: Float): SquareCrop {
     require(width > 0 && height > 0)
     val side = (min(width, height) / zoom.coerceIn(1f, 5f)).roundToInt().coerceIn(1, min(width, height))
@@ -67,4 +68,29 @@ fun saveCrop(context: Context, bitmap: Bitmap, crop: SquareCrop): String {
     val file = File(context.cacheDir, "person-crop-${UUID.randomUUID()}.jpg")
     file.outputStream().use { check(result.compress(Bitmap.CompressFormat.JPEG, 92, it)) }
     return file.absolutePath
+}
+
+/**
+ * Safely removes a temporary crop staging file from cacheDir.
+ * Never deletes persistent photos referenced by saved profiles in filesDir/people-photos.
+ */
+fun cleanupCropFile(path: String?) {
+    if (path.isNullOrBlank()) return
+    runCatching {
+        val file = File(path)
+        if (file.exists() && file.name.startsWith("person-crop-")) {
+            file.delete()
+        }
+    }
+}
+
+/**
+ * Sweeps orphaned crop staging files from cacheDir to avoid storage bloat.
+ */
+fun cleanupOrphanedCrops(context: Context) {
+    runCatching {
+        context.cacheDir.listFiles { file -> file.name.startsWith("person-crop-") }?.forEach {
+            it.delete()
+        }
+    }
 }

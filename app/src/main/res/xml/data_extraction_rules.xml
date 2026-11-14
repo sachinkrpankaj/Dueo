@@ -1,19 +1,22 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Dueo Privacy & Data Extraction Rules (Android 12+ / API 31+)
+    Offline-first personal finance application policy:
+    - CLOUD BACKUP: Sensitive financial records, ledgers, photos, and databases are strictly
+      EXCLUDED from automatic cloud backup. Only non-sensitive appearance preferences are included.
+      Since only sharedpref is included, all files, databases, and roots are excluded by default.
+    - DEVICE TRANSFER: Local device-to-device migration (e.g., cable or direct WiFi during setup)
+      preserves the user's local records on their new device.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <!-- Include only non-sensitive appearance preferences. All files and databases are excluded. -->
+        <include domain="sharedpref" path="appearance.preferences_pb" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <!-- Device-to-device local migration includes local ledger and photos -->
+        <include domain="file" path="." />
+        <include domain="sharedpref" path="." />
+        <exclude domain="file" path="corrupted_backups" />
     </device-transfer>
-    -->
 </data-extraction-rules>
